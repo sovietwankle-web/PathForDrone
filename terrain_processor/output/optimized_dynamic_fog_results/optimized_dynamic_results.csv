@@ -1,0 +1,7 @@
+Algorithm,Start_Time,Execution_Time_s,Path_Cost,Path_Length,Success
+Dynamic_A*_t0,0,4.075307607650757,inf,0,False
+Dynamic_RRT_t0,0,0.3502531051635742,inf,0,False
+Dynamic_A*_t3,3,3.9871034622192383,inf,0,False
+Dynamic_RRT_t3,3,0.34186577796936035,inf,0,False
+Dynamic_A*_t6,6,3.3455562591552734,171.5402075868845,38,True
+Dynamic_RRT_t6,6,0.34626173973083496,inf,0,False

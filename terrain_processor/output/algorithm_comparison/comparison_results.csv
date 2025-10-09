@@ -1,0 +1,4 @@
+Algorithm,Success,Execution_Time_s,Path_Cost,Path_Length,Notes
+Eikonal_FMM,True,25.927918910980225,13.499999999999998,10001,Normal execution
+Dynamic_AStar,False,0,inf,0,Python integer 47970 out of bounds for int16
+Dynamic_RRT,False,0,inf,0,Python integer 47970 out of bounds for int16

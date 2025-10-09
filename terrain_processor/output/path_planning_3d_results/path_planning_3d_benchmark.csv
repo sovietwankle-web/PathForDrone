@@ -1,0 +1,5 @@
+Algorithm,Execution_Time_s,Path_Cost,Path_Length,Success,Error
+Dijkstra_3D,107.94221687316895,0,135,True,
+A*_3D,99.14953684806824,0,135,True,
+RRT_3D,0.2622191905975342,inf,0,False,
+Straight_Line_3D,0.0,inf,0,False,
