@@ -13,7 +13,8 @@ Author: Optimized Path Planning Implementation
 import numpy as np
 import heapq
 from typing import Tuple, List, Optional, Dict, Any, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import exp
 import time
 
 
@@ -25,6 +26,27 @@ class ViscosityParams:
     fog_weight: float = 0.5         # 雾气/环境影响权重
     roughness_window: int = 3       # 粗糙度计算窗口大小
     min_viscosity: float = 0.01     # 最小粘滞系数（防止除零）
+
+
+@dataclass
+class MultiPathParams:
+    """多路径规划参数"""
+    n_paths: int = 3                    # 需要的路径数量 K
+    penalty_weight: float = 0.5         # 惩罚强度 (0=无惩罚, 1=完全阻断)
+    penalty_radius: int = 5             # 惩罚影响半径（原始分辨率像素）
+    min_path_separation: float = 10.0   # 最小路径间距（欧氏距离）
+    penalty_decay: str = 'gaussian'     # 衰减模式: 'gaussian' 或 'linear'
+    max_cost_ratio: float = 3.0         # 最大允许代价比（相对首条路径）
+
+
+@dataclass
+class MultiPathResult:
+    """多路径规划结果"""
+    paths: List[List[Tuple[float, ...]]]            # K条路径
+    costs: List[float]                               # 每条路径的代价
+    stats: Dict[str, Any] = field(default_factory=dict)          # 汇总统计
+    per_path_stats: List[Dict[str, Any]] = field(default_factory=list)  # 每条路径详细统计
+    diversity_matrix: Optional[np.ndarray] = None    # K×K 路径间距矩阵
 
 
 class ViscosityField:
@@ -976,6 +998,281 @@ class HierarchicalPathPlanner:
         return self._solve_at_level(0, start, goal)
 
 
+class MultiPathPlanner:
+    """
+    多路径规划器
+
+    使用迭代惩罚方法在粘滞分层FMM框架下找到K条多样化的替代路径。
+
+    算法:
+    1. 使用原始速度场找到最优路径 P_1
+    2. 在所有金字塔层级的速度场上施加惩罚（降低 P_1 附近的速度）
+    3. 使用惩罚后的速度场找到次优路径 P_2
+    4. 重复直到找到K条路径或无法找到更多满足条件的路径
+    """
+
+    def __init__(self, terrain: np.ndarray,
+                 fog_data: Optional[np.ndarray] = None,
+                 n_levels: int = 3,
+                 viscosity_params: Optional[ViscosityParams] = None,
+                 multi_path_params: Optional[MultiPathParams] = None,
+                 spacing: Tuple[float, ...] = (1.0, 1.0, 1.0)):
+        """
+        初始化多路径规划器
+
+        Args:
+            terrain: 地形数据
+            fog_data: 雾气数据
+            n_levels: 金字塔层级数
+            viscosity_params: 粘滞系数参数
+            multi_path_params: 多路径参数
+            spacing: 网格间距
+        """
+        self.multi_params = multi_path_params or MultiPathParams()
+        self.n_levels = n_levels
+
+        # 创建分层规划器
+        self.planner = HierarchicalPathPlanner(
+            terrain=terrain,
+            fog_data=fog_data,
+            n_levels=n_levels,
+            viscosity_params=viscosity_params,
+            spacing=spacing
+        )
+
+        # 保存原始速度场的深拷贝（用于每次迭代前恢复）
+        self._original_speed_levels = [
+            level.copy() for level in self.planner.pyramid.speed_levels
+        ]
+
+    def plan_multi_path(self, start: Tuple[int, ...],
+                        goal: Tuple[int, ...]) -> MultiPathResult:
+        """
+        多路径规划主函数
+
+        Args:
+            start: 起点（原始分辨率坐标）
+            goal: 终点（原始分辨率坐标）
+
+        Returns:
+            MultiPathResult 包含多条路径及统计信息
+        """
+        total_start_time = time.time()
+
+        found_paths: List[List[Tuple[float, ...]]] = []
+        found_costs: List[float] = []
+        per_path_stats: List[Dict[str, Any]] = []
+
+        # 累积惩罚掩码（每层级一个，初始全1.0）
+        penalty_masks = [
+            np.ones_like(speed, dtype=np.float64)
+            for speed in self._original_speed_levels
+        ]
+
+        # 允许额外尝试次数（路径太相似时跳过但继续尝试）
+        max_attempts = self.multi_params.n_paths * 2
+
+        for attempt in range(max_attempts):
+            if len(found_paths) >= self.multi_params.n_paths:
+                break
+
+            # 将惩罚后的速度场写入金字塔
+            for level in range(self.n_levels):
+                self.planner.pyramid.speed_levels[level] = (
+                    self._original_speed_levels[level] * penalty_masks[level]
+                )
+
+            # 求解
+            path_k, stats_k = self.planner.plan(start, goal)
+
+            if not path_k:
+                break
+
+            cost_k = stats_k.get('path_cost', float('inf'))
+
+            # 代价超标检查
+            if found_costs and cost_k > found_costs[0] * self.multi_params.max_cost_ratio:
+                break
+
+            # 多样性检查
+            if found_paths:
+                min_sep = min(
+                    self._compute_path_separation(path_k, existing)
+                    for existing in found_paths
+                )
+                if min_sep < self.multi_params.min_path_separation:
+                    # 路径太相似，仍施加惩罚但不保存
+                    self._apply_penalty_to_speed_levels(path_k, penalty_masks)
+                    continue
+
+            # 保存路径
+            found_paths.append(path_k)
+            found_costs.append(cost_k)
+            per_path_stats.append(stats_k)
+
+            # 施加惩罚
+            self._apply_penalty_to_speed_levels(path_k, penalty_masks)
+
+        # 恢复原始速度场
+        for level in range(self.n_levels):
+            self.planner.pyramid.speed_levels[level] = (
+                self._original_speed_levels[level].copy()
+            )
+
+        # 计算多样性矩阵
+        diversity_matrix = self._compute_diversity_matrix(found_paths)
+
+        total_time = time.time() - total_start_time
+
+        stats = {
+            'success': len(found_paths) > 0,
+            'n_paths_found': len(found_paths),
+            'n_paths_requested': self.multi_params.n_paths,
+            'total_time': total_time,
+        }
+
+        return MultiPathResult(
+            paths=found_paths,
+            costs=found_costs,
+            stats=stats,
+            per_path_stats=per_path_stats,
+            diversity_matrix=diversity_matrix
+        )
+
+    def _apply_penalty_to_speed_levels(self, path: List[Tuple[float, ...]],
+                                        penalty_masks: List[np.ndarray]) -> None:
+        """
+        在所有金字塔层级的惩罚掩码上施加路径惩罚
+
+        Args:
+            path: 路径点列表（原始分辨率坐标）
+            penalty_masks: 各层级惩罚掩码列表（会被就地修改）
+        """
+        for level in range(self.n_levels):
+            shape = self.planner.pyramid.shapes[level]
+            scale = 2 ** level
+            ndim = len(shape)
+
+            # 缩放路径坐标到当前层级
+            scaled_radius = max(1, self.multi_params.penalty_radius // scale)
+
+            # 对路径进行子采样（每隔 scale 个点取一个，减少计算量）
+            step = max(1, scale)
+            for point in path[::step]:
+                idx = tuple(
+                    max(0, min(int(round(c / scale)), shape[d] - 1))
+                    for d, c in enumerate(point)
+                )
+
+                # 在半径范围内施加惩罚
+                for neighbor in self._neighborhood_iterator(idx, scaled_radius, shape):
+                    dist = np.sqrt(sum(
+                        (a - b) ** 2 for a, b in zip(idx, neighbor)
+                    ))
+                    if dist > scaled_radius:
+                        continue
+
+                    # 计算衰减因子
+                    if self.multi_params.penalty_decay == 'gaussian':
+                        sigma = scaled_radius / 2.0
+                        decay = exp(-(dist ** 2) / (2 * sigma ** 2))
+                    else:  # linear
+                        decay = 1.0 - dist / scaled_radius if scaled_radius > 0 else 1.0
+
+                    penalty = 1.0 - self.multi_params.penalty_weight * decay
+                    # 累积惩罚（取最小值，只会降低不会恢复）
+                    penalty_masks[level][neighbor] = min(
+                        penalty_masks[level][neighbor], penalty
+                    )
+
+    @staticmethod
+    def _neighborhood_iterator(center: Tuple[int, ...],
+                                radius: int,
+                                shape: Tuple[int, ...]):
+        """
+        生成中心点周围给定半径内的所有有效整数坐标
+
+        Args:
+            center: 中心点坐标
+            radius: 邻域半径
+            shape: 网格形状（用于边界检查）
+
+        Yields:
+            有效邻域坐标元组
+        """
+        ndim = len(shape)
+        # 生成各维度的范围
+        ranges = []
+        for d in range(ndim):
+            lo = max(0, center[d] - radius)
+            hi = min(shape[d] - 1, center[d] + radius)
+            ranges.append(range(lo, hi + 1))
+
+        if ndim == 3:
+            for z in ranges[0]:
+                for y in ranges[1]:
+                    for x in ranges[2]:
+                        yield (z, y, x)
+        elif ndim == 2:
+            for y in ranges[0]:
+                for x in ranges[1]:
+                    yield (y, x)
+
+    def _compute_path_separation(self, path_a: List[Tuple[float, ...]],
+                                  path_b: List[Tuple[float, ...]]) -> float:
+        """
+        计算两条路径之间的平均最小距离
+
+        Args:
+            path_a: 路径A
+            path_b: 路径B
+
+        Returns:
+            平均最小距离
+        """
+        if not path_a or not path_b:
+            return 0.0
+
+        # 子采样到最多100个点
+        step_a = max(1, len(path_a) // 100)
+        step_b = max(1, len(path_b) // 100)
+        sampled_a = path_a[::step_a]
+        sampled_b = path_b[::step_b]
+
+        arr_a = np.array(sampled_a)
+        arr_b = np.array(sampled_b)
+
+        # 对 path_a 中每个点，找到 path_b 中最近点的距离
+        min_dists = []
+        for pa in arr_a:
+            dists = np.sqrt(np.sum((arr_b - pa) ** 2, axis=1))
+            min_dists.append(np.min(dists))
+
+        return float(np.mean(min_dists))
+
+    def _compute_diversity_matrix(self,
+                                   paths: List[List[Tuple[float, ...]]]) -> np.ndarray:
+        """
+        计算路径间多样性矩阵
+
+        Args:
+            paths: 路径列表
+
+        Returns:
+            K×K 对称距离矩阵
+        """
+        k = len(paths)
+        matrix = np.zeros((k, k), dtype=np.float64)
+
+        for i in range(k):
+            for j in range(i + 1, k):
+                sep = self._compute_path_separation(paths[i], paths[j])
+                matrix[i, j] = sep
+                matrix[j, i] = sep
+
+        return matrix
+
+
 def create_test_terrain_3d(shape: Tuple[int, int, int] = (30, 50, 50)) -> np.ndarray:
     """创建测试用3D地形"""
     nz, ny, nx = shape
@@ -1122,6 +1419,143 @@ def visualize_results(terrain: np.ndarray,
     print("Result saved to hierarchical_fmm_result.png")
 
 
+def visualize_multi_path_results(terrain: np.ndarray,
+                                  result: MultiPathResult,
+                                  viscosity: np.ndarray):
+    """多路径可视化结果"""
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        print("Matplotlib not available, skipping visualization")
+        return
+
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
+    fig = plt.figure(figsize=(16, 12))
+    ndim = terrain.ndim
+    paths = result.paths
+
+    if ndim == 3:
+        # 3D路径视图
+        ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+        for i, path in enumerate(paths):
+            if path:
+                path_array = np.array(path)
+                c = colors[i % len(colors)]
+                label = f'Path {i+1} (cost={result.costs[i]:.1f})'
+                ax1.plot3D(path_array[:, 2], path_array[:, 1], path_array[:, 0],
+                          '-', color=c, linewidth=2, label=label)
+        if paths:
+            ax1.scatter([paths[0][0][2]], [paths[0][0][1]], [paths[0][0][0]],
+                       c='lime', s=100, marker='o', label='Start', zorder=5)
+            ax1.scatter([paths[0][-1][2]], [paths[0][-1][1]], [paths[0][-1][0]],
+                       c='black', s=100, marker='*', label='Goal', zorder=5)
+        ax1.set_xlabel('X')
+        ax1.set_ylabel('Y')
+        ax1.set_zlabel('Z')
+        ax1.set_title('Multi-Path 3D View')
+        ax1.legend(fontsize=8)
+
+        # 粘滞系数切片 + 多路径投影
+        ax2 = fig.add_subplot(2, 2, 2)
+        mid_z = terrain.shape[0] // 2
+        im = ax2.imshow(viscosity[mid_z], cmap='viridis', origin='lower')
+        plt.colorbar(im, ax=ax2, label='Viscosity')
+        for i, path in enumerate(paths):
+            if path:
+                path_array = np.array(path)
+                z_indices = np.abs(path_array[:, 0] - mid_z) < 3
+                if np.any(z_indices):
+                    ax2.plot(path_array[z_indices, 2], path_array[z_indices, 1],
+                            '-', color=colors[i % len(colors)], linewidth=2,
+                            label=f'Path {i+1}')
+        ax2.set_title(f'Viscosity + Paths (Z={mid_z} slice)')
+        ax2.set_xlabel('X')
+        ax2.set_ylabel('Y')
+        ax2.legend(fontsize=8)
+
+        # 地形切片 + 多路径
+        ax3 = fig.add_subplot(2, 2, 3)
+        im = ax3.imshow(terrain[mid_z], cmap='terrain', origin='lower')
+        plt.colorbar(im, ax=ax3, label='Elevation')
+        for i, path in enumerate(paths):
+            if path:
+                path_array = np.array(path)
+                z_indices = np.abs(path_array[:, 0] - mid_z) < 3
+                if np.any(z_indices):
+                    ax3.plot(path_array[z_indices, 2], path_array[z_indices, 1],
+                            '-', color=colors[i % len(colors)], linewidth=2)
+        ax3.set_title(f'Terrain + Paths (Z={mid_z} slice)')
+        ax3.set_xlabel('X')
+        ax3.set_ylabel('Y')
+
+    else:
+        # 2D可视化
+        ax1 = fig.add_subplot(2, 2, 1)
+        im = ax1.imshow(terrain, cmap='terrain', origin='lower')
+        plt.colorbar(im, ax=ax1, label='Elevation')
+        for i, path in enumerate(paths):
+            if path:
+                path_array = np.array(path)
+                c = colors[i % len(colors)]
+                ax1.plot(path_array[:, 1], path_array[:, 0], '-', color=c,
+                        linewidth=2, label=f'Path {i+1}')
+        if paths:
+            ax1.scatter([paths[0][0][1]], [paths[0][0][0]], c='lime', s=100, marker='o')
+            ax1.scatter([paths[0][-1][1]], [paths[0][-1][0]], c='black', s=100, marker='*')
+        ax1.set_title('Terrain with Multi-Paths')
+        ax1.legend(fontsize=8)
+
+        ax2 = fig.add_subplot(2, 2, 2)
+        im = ax2.imshow(viscosity, cmap='viridis', origin='lower')
+        plt.colorbar(im, ax=ax2, label='Viscosity')
+        for i, path in enumerate(paths):
+            if path:
+                path_array = np.array(path)
+                ax2.plot(path_array[:, 1], path_array[:, 0], '-',
+                        color=colors[i % len(colors)], linewidth=2)
+        ax2.set_title('Viscosity + Paths')
+
+        ax3 = fig.add_subplot(2, 2, 3)
+
+    # 统计信息面板
+    ax4 = fig.add_subplot(2, 2, 4)
+    ax4.axis('off')
+
+    stats_text = "Multi-Path Statistics:\n"
+    stats_text += f"Paths found: {result.stats.get('n_paths_found', 0)}"
+    stats_text += f" / {result.stats.get('n_paths_requested', 0)}\n"
+    stats_text += f"Total time: {result.stats.get('total_time', 0):.4f}s\n\n"
+
+    for i, (path, cost) in enumerate(zip(result.paths, result.costs)):
+        ratio = cost / result.costs[0] if result.costs[0] > 0 else 0
+        tag = " (optimal)" if i == 0 else f" (+{(ratio - 1) * 100:.0f}%)"
+        stats_text += f"Path {i+1}: cost={cost:.2f}, points={len(path)}{tag}\n"
+
+    if result.diversity_matrix is not None and len(result.paths) > 1:
+        stats_text += "\nDiversity (avg min dist):\n"
+        k = len(result.paths)
+        header = "      " + "".join(f"  P{j+1:d}" for j in range(k))
+        stats_text += header + "\n"
+        for i in range(k):
+            row = f"  P{i+1:d} "
+            for j in range(k):
+                if i == j:
+                    row += "    - "
+                else:
+                    row += f" {result.diversity_matrix[i, j]:5.1f}"
+            stats_text += row + "\n"
+
+    ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes,
+             fontsize=9, verticalalignment='top', fontfamily='monospace')
+    ax4.set_title('Statistics')
+
+    plt.tight_layout()
+    plt.savefig('multi_path_fmm_result.png', dpi=150)
+    plt.show()
+    print("Result saved to multi_path_fmm_result.png")
+
+
 def main():
     """主函数：测试分层路径规划"""
     print("=" * 60)
@@ -1206,10 +1640,67 @@ def main():
         print(f"   Visualization skipped: {e}")
 
     print("\n" + "=" * 60)
-    print("Demo completed successfully!")
+    print("Single-Path Demo completed!")
     print("=" * 60)
 
-    return path_hierarchical, stats_hierarchical
+    # ======== 多路径规划 Demo ========
+    print("\n" + "=" * 60)
+    print("Multi-Path Planning Demo")
+    print("=" * 60)
+
+    multi_params = MultiPathParams(
+        n_paths=3,
+        penalty_weight=0.5,
+        penalty_radius=5,
+        min_path_separation=8.0,
+        max_cost_ratio=3.0
+    )
+
+    multi_planner = MultiPathPlanner(
+        terrain=terrain,
+        fog_data=fog_data,
+        n_levels=3,
+        viscosity_params=params,
+        multi_path_params=multi_params,
+        spacing=(1.0, 1.0, 1.0)
+    )
+
+    print(f"\n6. Finding {multi_params.n_paths} diverse paths from {start} to {goal}...")
+    result = multi_planner.plan_multi_path(start, goal)
+
+    print(f"   Paths found: {result.stats.get('n_paths_found', 0)}")
+    print(f"   Total time: {result.stats.get('total_time', 0):.4f}s")
+
+    for i, (p, cost) in enumerate(zip(result.paths, result.costs)):
+        ratio = cost / result.costs[0] if result.costs[0] > 0 else 0
+        tag = "(optimal)" if i == 0 else f"(+{(ratio - 1) * 100:.0f}%)"
+        print(f"   Path {i+1}: cost={cost:.2f} {tag}, points={len(p)}")
+
+    if result.diversity_matrix is not None and len(result.paths) > 1:
+        print(f"\n   Diversity matrix (avg min distance):")
+        k = len(result.paths)
+        header = "         " + "".join(f"  P{j+1:d}" for j in range(k))
+        print(header)
+        for i in range(k):
+            row = f"      P{i+1:d} "
+            for j in range(k):
+                if i == j:
+                    row += "    - "
+                else:
+                    row += f" {result.diversity_matrix[i, j]:5.1f}"
+            print(row)
+
+    print("\n7. Generating multi-path visualization...")
+    try:
+        visualize_multi_path_results(terrain, result, viscosity)
+    except Exception as e:
+        print(f"   Visualization skipped: {e}")
+
+    print("\n" + "=" * 60)
+    print("All demos completed successfully!")
+    print("=" * 60)
+
+    return result
 
 
 if __name__ == "__main__":
