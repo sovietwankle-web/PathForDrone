@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(cd /c/Users/lizuo/project/path && MPLBACKEND=Agg python terrain_processor/viscous_hierarchical_fmm.py 2>&1)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:www.alphaxiv.org)",
+      "WebSearch"
+    ]
+  }
+}

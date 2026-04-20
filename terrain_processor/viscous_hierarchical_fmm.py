@@ -49,6 +49,76 @@ class MultiPathResult:
     diversity_matrix: Optional[np.ndarray] = None    # K×K 路径间距矩阵
 
 
+@dataclass
+class GasDiffusionParams:
+    """多机器人路径点分配参数（不互溶气体扩散模型）"""
+    n_robots: int = 3                                       # 机器人/气体数量
+    robot_starts: List[Tuple[int, ...]] = field(default_factory=list)  # 各机器人起点
+    waypoints: List[Tuple[int, ...]] = field(default_factory=list)     # 待分配路径点
+    max_waypoints_per_robot: Optional[int] = None           # 每机器人最大路径点数（None=不限）
+
+
+@dataclass
+class WaypointAllocationResult:
+    """路径点分配结果"""
+    assignments: Dict[int, List[Tuple[int, ...]]] = field(default_factory=dict)
+    # robot_id → 按到达时间排序的路径点列表
+    assignment_order: List[Tuple[int, int]] = field(default_factory=list)
+    # (robot_id, waypoint_idx) 按全局时间排序
+    robot_paths: Dict[int, List[List[Tuple[float, ...]]]] = field(default_factory=dict)
+    # robot_id → 路径段列表 [start→wp1, wp1→wp2, ...]
+    arrival_times: Dict[int, List[float]] = field(default_factory=dict)
+    # robot_id → 各路径点到达时间
+    territory_map: Optional[np.ndarray] = None
+    # 领土地图：每个像素属于哪个机器人 (-1=未占领)
+    stats: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class QValueMultiPathParams:
+    """Q值多路径规划参数
+
+    在目标区域内存在一个 Q 值场（得分场），多路径规划不仅考虑路径代价，
+    还考虑终点在目标区域内的 Q 值。最终综合得分:
+        score = q_weight × Q(goal) - cost_weight × path_cost（归一化后）
+    选择 score 最大的路径作为最优路径。
+    """
+    n_paths: int = 5                    # 候选路径数量
+    q_weight: float = 1.0              # Q值权重
+    cost_weight: float = 0.5           # 路径代价权重
+    penalty_weight: float = 0.5        # 多路径惩罚强度
+    penalty_radius: int = 5            # 惩罚半径
+    min_path_separation: float = 8.0   # 最小路径间距
+    penalty_decay: str = 'gaussian'    # 衰减模式
+    max_cost_ratio: float = 5.0        # 最大代价比（宽松，因为高Q值可能需要更远的路径）
+
+
+@dataclass
+class QValueMultiPathResult:
+    """Q值多路径规划结果"""
+    best_path: List[Tuple[float, ...]] = field(default_factory=list)
+    # 最优路径（综合得分最高）
+    best_goal: Tuple[int, ...] = field(default_factory=tuple)
+    # 最优终点
+    best_score: float = 0.0
+    # 最优综合得分
+    best_q_value: float = 0.0
+    # 最优终点的 Q 值
+    best_cost: float = 0.0
+    # 最优路径的代价
+    all_paths: List[List[Tuple[float, ...]]] = field(default_factory=list)
+    # 所有候选路径
+    all_goals: List[Tuple[int, ...]] = field(default_factory=list)
+    # 所有候选终点
+    all_scores: List[float] = field(default_factory=list)
+    # 所有候选得分
+    all_q_values: List[float] = field(default_factory=list)
+    # 所有候选 Q 值
+    all_costs: List[float] = field(default_factory=list)
+    # 所有候选代价
+    stats: Dict[str, Any] = field(default_factory=dict)
+
+
 class ViscosityField:
     """
     粘滞系数场计算
@@ -1273,6 +1343,747 @@ class MultiPathPlanner:
         return matrix
 
 
+class CompetitiveFMM:
+    """
+    竞争性快速行进法（不互溶气体扩散模型）
+
+    多个气体（机器人）同时从各自起点扩散，竞争领土。
+    - 共享优先队列，按 phi 值（到达时间）排序
+    - 不互溶性：一旦某个气体占领某个像素，其他气体无法进入
+    - 惠更斯原理：气体到达路径点后，从该路径点继续扩散（累积 phi）
+
+    基于 NarrowBandFMM 的 Godunov 格式求解 Eikonal 方程。
+    """
+
+    FAR = 0
+    CONSIDERED = 1
+    ACCEPTED = 2
+
+    def __init__(self, speed_field: np.ndarray, spacing: Tuple[float, ...]):
+        """
+        Args:
+            speed_field: 速度场 (与地形同形状)
+            spacing: 网格间距
+        """
+        self.speed_field = speed_field
+        self.spacing = spacing
+        self.shape = speed_field.shape
+        self.ndim = speed_field.ndim
+
+    def solve(self, robot_starts: List[Tuple[int, ...]],
+              waypoints: List[Tuple[int, ...]],
+              max_per_robot: Optional[int] = None
+              ) -> Tuple[Dict[int, List[Tuple[int, ...]]],
+                         np.ndarray,
+                         Dict[int, List[float]],
+                         List[Tuple[int, int]]]:
+        """
+        执行竞争性 FMM 扩散
+
+        Args:
+            robot_starts: 各机器人起点列表
+            waypoints: 待分配路径点列表
+            max_per_robot: 每机器人最大路径点数
+
+        Returns:
+            assignments: robot_id → 路径点列表（按到达顺序）
+            territory_map: 领土地图 (-1=未占领, 0..n-1=机器人编号)
+            arrival_times: robot_id → 各路径点到达时间列表
+            assignment_order: (robot_id, waypoint_idx) 全局到达顺序
+        """
+        n_robots = len(robot_starts)
+
+        # 状态存储（稀疏）
+        phi = {}           # point → phi value
+        status = {}        # point → FAR/CONSIDERED/ACCEPTED
+        owner = {}         # point → robot_id
+
+        # 领土地图（稠密，用于可视化）
+        territory_map = np.full(self.shape, -1, dtype=np.int32)
+
+        # 路径点集合（用于快速查找）
+        waypoint_set = set(waypoints)
+        remaining_waypoints = set(waypoints)
+
+        # 分配结果
+        assignments = {r: [] for r in range(n_robots)}
+        arrival_times = {r: [] for r in range(n_robots)}
+        assignment_order = []
+        robot_wp_count = {r: 0 for r in range(n_robots)}
+
+        # 优先队列：(phi_value, counter, point, robot_id)
+        heap = []
+        counter = 0
+
+        # 初始化：各机器人起点
+        for r, start in enumerate(robot_starts):
+            start = tuple(start)
+            phi[start] = 0.0
+            status[start] = self.ACCEPTED
+            owner[start] = r
+            territory_map[start] = r
+
+            # 将起点邻居加入队列
+            for neighbor in self._get_neighbors(start):
+                if neighbor not in status or status[neighbor] == self.FAR:
+                    new_phi = self._solve_eikonal_at_point(neighbor, phi, owner, r)
+                    if new_phi < float('inf'):
+                        phi[neighbor] = new_phi
+                        status[neighbor] = self.CONSIDERED
+                        owner[neighbor] = r
+                        heapq.heappush(heap, (new_phi, counter, neighbor, r))
+                        counter += 1
+
+        # 主循环
+        max_iterations = self.shape[0] * self.shape[1]
+        if self.ndim == 3:
+            max_iterations *= self.shape[2]
+
+        iteration = 0
+        while heap and remaining_waypoints and iteration < max_iterations:
+            iteration += 1
+
+            phi_val, _, point, robot_id = heapq.heappop(heap)
+
+            # 已被接受则跳过
+            if point in status and status[point] == self.ACCEPTED:
+                continue
+
+            # 该点已被其他气体占领（不互溶）
+            if point in owner and owner[point] != robot_id and status.get(point) == self.ACCEPTED:
+                continue
+
+            # 如果该点已有更好的 phi 值，跳过过时条目
+            if point in phi and phi_val > phi[point] * 1.01:
+                continue
+
+            # 标记为 ACCEPTED
+            status[point] = self.ACCEPTED
+            phi[point] = phi_val
+            owner[point] = robot_id
+            territory_map[point] = robot_id
+
+            # 检查是否到达路径点
+            if point in remaining_waypoints:
+                # 容量检查
+                if max_per_robot is None or robot_wp_count[robot_id] < max_per_robot:
+                    wp_idx = waypoints.index(point)
+                    assignments[robot_id].append(point)
+                    arrival_times[robot_id].append(phi_val)
+                    assignment_order.append((robot_id, wp_idx))
+                    robot_wp_count[robot_id] += 1
+                    remaining_waypoints.discard(point)
+
+                    # 惠更斯原理：从该路径点重新开始扩散
+                    # 使用累积 phi（不重置），作为新的波源
+                    for neighbor in self._get_neighbors(point):
+                        if neighbor in status and status[neighbor] == self.ACCEPTED:
+                            continue
+                        # 如果邻居已被其他气体占领，跳过（不互溶）
+                        if (neighbor in owner and owner[neighbor] != robot_id
+                                and neighbor in status and status[neighbor] == self.ACCEPTED):
+                            continue
+
+                        new_phi = self._solve_eikonal_at_point(neighbor, phi, owner, robot_id)
+                        if new_phi < float('inf'):
+                            if neighbor not in phi or new_phi < phi[neighbor]:
+                                phi[neighbor] = new_phi
+                                status[neighbor] = self.CONSIDERED
+                                owner[neighbor] = robot_id
+                                heapq.heappush(heap, (new_phi, counter, neighbor, robot_id))
+                                counter += 1
+
+            # 扩展邻居
+            for neighbor in self._get_neighbors(point):
+                if neighbor in status and status[neighbor] == self.ACCEPTED:
+                    continue
+
+                new_phi = self._solve_eikonal_at_point(neighbor, phi, owner, robot_id)
+                if new_phi < float('inf'):
+                    if neighbor not in phi or new_phi < phi[neighbor]:
+                        phi[neighbor] = new_phi
+                        status[neighbor] = self.CONSIDERED
+                        owner[neighbor] = robot_id
+                        heapq.heappush(heap, (new_phi, counter, neighbor, robot_id))
+                        counter += 1
+
+        return assignments, territory_map, arrival_times, assignment_order
+
+    def _get_neighbors(self, point: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+        """获取有效邻居点（6邻域/4邻域）"""
+        neighbors = []
+        for d in range(self.ndim):
+            for delta in (-1, 1):
+                neighbor = list(point)
+                neighbor[d] += delta
+                if 0 <= neighbor[d] < self.shape[d]:
+                    neighbors.append(tuple(neighbor))
+        return neighbors
+
+    def _solve_eikonal_at_point(self, point: Tuple[int, ...],
+                                 phi: Dict, owner: Dict,
+                                 robot_id: int) -> float:
+        """
+        在给定点求解 Eikonal 方程（Godunov 格式）
+        只使用同一气体（机器人）已接受的邻居值。
+
+        Args:
+            point: 待求解点
+            phi: 全局 phi 字典
+            owner: 全局 owner 字典
+            robot_id: 当前气体编号
+
+        Returns:
+            该点的 phi 值
+        """
+        speed = self.speed_field[point]
+        if speed <= 0:
+            return float('inf')
+
+        # 收集各维度的最小已接受邻居 phi
+        phi_neighbors = []
+        for d in range(self.ndim):
+            candidates = []
+            for delta in (-1, 1):
+                neighbor = list(point)
+                neighbor[d] += delta
+                if not (0 <= neighbor[d] < self.shape[d]):
+                    continue
+                neighbor = tuple(neighbor)
+                if (neighbor in phi and
+                    owner.get(neighbor) == robot_id):
+                    candidates.append(phi[neighbor])
+
+            if candidates:
+                phi_neighbors.append((min(candidates), self.spacing[d] if d < len(self.spacing) else 1.0))
+
+        if not phi_neighbors:
+            return float('inf')
+
+        # 按 phi 值排序
+        phi_neighbors.sort(key=lambda x: x[0])
+
+        slowness = 1.0 / speed
+
+        # 尝试从高维到低维求解
+        for n_dims in range(len(phi_neighbors), 0, -1):
+            subset = phi_neighbors[:n_dims]
+            result = self._solve_quadratic(subset, slowness)
+            if result is not None and result >= subset[-1][0]:
+                return result
+
+        # 1D fallback
+        phi_min, h = phi_neighbors[0]
+        return phi_min + h * slowness
+
+    @staticmethod
+    def _solve_quadratic(phi_h_pairs: List[Tuple[float, float]],
+                          slowness: float) -> Optional[float]:
+        """
+        求解多维 Eikonal 二次方程
+
+        sum_d ((phi - phi_d) / h_d)^2 = slowness^2
+        """
+        # a * phi^2 - 2b * phi + c = 0
+        a = 0.0
+        b = 0.0
+        c = -slowness * slowness
+
+        for phi_d, h_d in phi_h_pairs:
+            inv_h2 = 1.0 / (h_d * h_d)
+            a += inv_h2
+            b += phi_d * inv_h2
+            c += phi_d * phi_d * inv_h2
+
+        discriminant = b * b - a * c
+        if discriminant < 0:
+            return None
+
+        return (b + discriminant ** 0.5) / a
+
+
+class MultiRobotWaypointAllocator:
+    """
+    多机器人路径点分配器
+
+    使用不互溶气体扩散模型（竞争性 FMM + 惠更斯原理）将路径点分配给多个机器人，
+    然后为每个机器人规划路径段。
+
+    工作流程：
+    1. 竞争性 FMM：多种气体同时扩散，先到先得
+    2. 惠更斯原理：气体到达路径点后，从该点继续扩散
+    3. 路径规划：为每个机器人规划起点 → 路径点1 → 路径点2 → ... 的路径
+    """
+
+    def __init__(self, terrain: np.ndarray,
+                 fog_data: Optional[np.ndarray] = None,
+                 n_levels: int = 3,
+                 viscosity_params: Optional[ViscosityParams] = None,
+                 gas_params: Optional[GasDiffusionParams] = None,
+                 spacing: Tuple[float, ...] = (1.0, 1.0, 1.0),
+                 use_neural: bool = False,
+                 neural_model_path: Optional[str] = None):
+        """
+        Args:
+            terrain: 地形数据
+            fog_data: 雾气数据
+            n_levels: 金字塔层级数（用于路径规划阶段）
+            viscosity_params: 粘滞系数参数
+            gas_params: 气体扩散分配参数
+            spacing: 网格间距
+            use_neural: 是否使用神经网络分配器（替代 CompetitiveFMM）
+            neural_model_path: 神经网络模型路径（.pt 文件）
+        """
+        self.use_neural = use_neural
+        self.neural_model_path = neural_model_path
+        self.terrain = terrain
+        self.gas_params = gas_params or GasDiffusionParams()
+        self.viscosity_params = viscosity_params or ViscosityParams()
+        self.spacing = spacing
+        self.n_levels = n_levels
+        self.fog_data = fog_data
+
+        # 计算速度场（原始分辨率，用于竞争性 FMM）
+        vf = ViscosityField(self.viscosity_params)
+        self.speed_field = vf.get_speed_field(terrain, fog_data, spacing=spacing)
+
+        # 路径规划器（用于分配后的路径段规划）
+        self.planner = HierarchicalPathPlanner(
+            terrain=terrain,
+            fog_data=fog_data,
+            n_levels=n_levels,
+            viscosity_params=viscosity_params,
+            spacing=spacing
+        )
+
+    def allocate(self) -> WaypointAllocationResult:
+        """
+        执行路径点分配与路径规划
+
+        Returns:
+            WaypointAllocationResult 包含分配、路径、领土地图和统计信息
+        """
+        # 如果启用神经网络分配器，委托给 NeuralWaypointAllocator
+        if self.use_neural:
+            from neural_allocator import NeuralWaypointAllocator
+            neural = NeuralWaypointAllocator(
+                terrain=self.terrain, fog_data=self.fog_data,
+                n_levels=self.n_levels, viscosity_params=self.viscosity_params,
+                gas_params=self.gas_params, spacing=self.spacing,
+                model_path=self.neural_model_path, fallback_to_fmm=True,
+            )
+            return neural.allocate()
+
+        total_start = time.time()
+
+        # Step 1: 竞争性 FMM 分配路径点
+        print("   [Gas Diffusion] Running competitive FMM...")
+        cfmm = CompetitiveFMM(self.speed_field, self.spacing)
+
+        alloc_start = time.time()
+        assignments, territory_map, arrival_times, assignment_order = cfmm.solve(
+            robot_starts=self.gas_params.robot_starts,
+            waypoints=self.gas_params.waypoints,
+            max_per_robot=self.gas_params.max_waypoints_per_robot
+        )
+        alloc_time = time.time() - alloc_start
+
+        print(f"   [Gas Diffusion] Allocation done in {alloc_time:.4f}s")
+        for r in range(self.gas_params.n_robots):
+            print(f"     Robot {r}: {len(assignments[r])} waypoints assigned")
+
+        # Step 2: 为每个机器人规划路径段
+        print("   [Path Planning] Planning path segments...")
+        plan_start = time.time()
+        robot_paths = {}
+
+        for robot_id, wp_list in assignments.items():
+            if not wp_list:
+                robot_paths[robot_id] = []
+                continue
+
+            # 构建路径链: start → wp1 → wp2 → ...
+            chain = [self.gas_params.robot_starts[robot_id]] + wp_list
+            segments = []
+
+            for i in range(len(chain) - 1):
+                seg_start = tuple(chain[i])
+                seg_goal = tuple(chain[i + 1])
+                try:
+                    path, _ = self.planner.plan(seg_start, seg_goal)
+                    if path:
+                        segments.append(path)
+                    else:
+                        segments.append([seg_start, seg_goal])
+                except Exception:
+                    segments.append([seg_start, seg_goal])
+
+            robot_paths[robot_id] = segments
+
+        plan_time = time.time() - plan_start
+        total_time = time.time() - total_start
+
+        # 统计信息
+        stats = {
+            'success': sum(len(v) for v in assignments.values()) > 0,
+            'n_robots': self.gas_params.n_robots,
+            'n_waypoints_total': len(self.gas_params.waypoints),
+            'n_waypoints_assigned': sum(len(v) for v in assignments.values()),
+            'allocation_time': alloc_time,
+            'path_planning_time': plan_time,
+            'total_time': total_time,
+            'per_robot': {
+                r: {
+                    'n_waypoints': len(assignments[r]),
+                    'n_segments': len(robot_paths.get(r, [])),
+                    'arrival_times': arrival_times[r],
+                }
+                for r in range(self.gas_params.n_robots)
+            }
+        }
+
+        return WaypointAllocationResult(
+            assignments=assignments,
+            assignment_order=assignment_order,
+            robot_paths=robot_paths,
+            arrival_times=arrival_times,
+            territory_map=territory_map,
+            stats=stats
+        )
+
+
+class QValueMultiPathPlanner:
+    """
+    Q值引导的多路径规划器
+
+    核心思想：目标不是一个精确点，而是一个目标区域。区域内每个像素有一个 Q 值（得分）。
+    规划器生成多条到达目标区域不同位置的候选路径，然后选择综合得分最高的路径。
+
+    综合得分公式（归一化后）:
+        score(path_k) = q_weight × Q_norm(goal_k) - cost_weight × cost_norm(path_k)
+
+    其中:
+        Q_norm = (Q - Q_min) / (Q_max - Q_min)        归一化到 [0, 1]
+        cost_norm = (cost - cost_min) / (cost_max - cost_min)  归一化到 [0, 1]
+
+    工作流程：
+    1. 在目标区域内按 Q 值排序，选出多个候选终点
+    2. 对每个候选终点，使用 FMM 规划路径
+    3. 在路径之间施加惩罚以保证多样性
+    4. 计算综合得分，选择最优路径
+    """
+
+    def __init__(self, terrain: np.ndarray,
+                 fog_data: Optional[np.ndarray] = None,
+                 n_levels: int = 3,
+                 viscosity_params: Optional[ViscosityParams] = None,
+                 q_params: Optional[QValueMultiPathParams] = None,
+                 spacing: Tuple[float, ...] = (1.0, 1.0, 1.0)):
+        """
+        Args:
+            terrain: 地形数据
+            fog_data: 雾气数据
+            n_levels: 金字塔层级数
+            viscosity_params: 粘滞系数参数
+            q_params: Q值多路径参数
+            spacing: 网格间距
+        """
+        self.q_params = q_params or QValueMultiPathParams()
+        self.n_levels = n_levels
+        self.spacing = spacing
+        self.terrain = terrain
+
+        # 创建内部多路径参数
+        self._multi_params = MultiPathParams(
+            n_paths=self.q_params.n_paths,
+            penalty_weight=self.q_params.penalty_weight,
+            penalty_radius=self.q_params.penalty_radius,
+            min_path_separation=self.q_params.min_path_separation,
+            penalty_decay=self.q_params.penalty_decay,
+            max_cost_ratio=self.q_params.max_cost_ratio
+        )
+
+        # 创建分层规划器
+        self.planner = HierarchicalPathPlanner(
+            terrain=terrain,
+            fog_data=fog_data,
+            n_levels=n_levels,
+            viscosity_params=viscosity_params,
+            spacing=spacing
+        )
+
+        # 保存原始速度场
+        self._original_speed_levels = [
+            level.copy() for level in self.planner.pyramid.speed_levels
+        ]
+
+    def plan(self, start: Tuple[int, ...],
+             q_field: np.ndarray,
+             target_mask: np.ndarray) -> QValueMultiPathResult:
+        """
+        Q值引导的多路径规划
+
+        Args:
+            start: 起点坐标
+            q_field: Q值场，与地形同形状，每个像素的得分
+            target_mask: 目标区域掩码（bool），True 表示目标区域内的有效终点
+
+        Returns:
+            QValueMultiPathResult
+        """
+        total_start = time.time()
+
+        # Step 1: 在目标区域内选出候选终点（按 Q 值降序）
+        candidate_goals = self._select_candidate_goals(q_field, target_mask)
+
+        if not candidate_goals:
+            return QValueMultiPathResult(stats={'success': False, 'error': 'No valid goals in target region'})
+
+        print(f"   [Q-Value Planner] {len(candidate_goals)} candidate goals selected")
+
+        # Step 2: 为每个候选终点规划路径（带惩罚保证多样性）
+        found_paths = []
+        found_goals = []
+        found_costs = []
+        found_q_values = []
+
+        penalty_masks = [
+            np.ones_like(speed, dtype=np.float64)
+            for speed in self._original_speed_levels
+        ]
+
+        max_attempts = self.q_params.n_paths * 2
+
+        goal_idx = 0
+        for attempt in range(max_attempts):
+            if len(found_paths) >= self.q_params.n_paths:
+                break
+            if goal_idx >= len(candidate_goals):
+                break
+
+            goal_point, q_val = candidate_goals[goal_idx]
+            goal_idx += 1
+
+            # 应用惩罚后的速度场
+            for level in range(self.n_levels):
+                self.planner.pyramid.speed_levels[level] = (
+                    self._original_speed_levels[level] * penalty_masks[level]
+                )
+
+            # 规划路径
+            path_k, stats_k = self.planner.plan(start, goal_point)
+
+            if not path_k:
+                continue
+
+            cost_k = stats_k.get('path_cost', float('inf'))
+
+            # 代价超标检查（相对第一条路径）
+            if found_costs and cost_k > found_costs[0] * self.q_params.max_cost_ratio:
+                continue
+
+            # 多样性检查
+            if found_paths:
+                min_sep = min(
+                    self._compute_path_separation(path_k, existing)
+                    for existing in found_paths
+                )
+                if min_sep < self.q_params.min_path_separation:
+                    self._apply_penalty(path_k, penalty_masks)
+                    continue
+
+            # 保存
+            found_paths.append(path_k)
+            found_goals.append(goal_point)
+            found_costs.append(cost_k)
+            found_q_values.append(q_val)
+
+            # 施加惩罚
+            self._apply_penalty(path_k, penalty_masks)
+
+        # 恢复原始速度场
+        for level in range(self.n_levels):
+            self.planner.pyramid.speed_levels[level] = (
+                self._original_speed_levels[level].copy()
+            )
+
+        if not found_paths:
+            return QValueMultiPathResult(stats={'success': False, 'error': 'No valid paths found'})
+
+        # Step 3: 计算综合得分
+        scores = self._compute_scores(found_q_values, found_costs)
+
+        # Step 4: 选择最优路径
+        best_idx = int(np.argmax(scores))
+
+        total_time = time.time() - total_start
+
+        stats = {
+            'success': True,
+            'n_candidates': len(candidate_goals),
+            'n_paths_found': len(found_paths),
+            'best_index': best_idx,
+            'total_time': total_time,
+            'q_weight': self.q_params.q_weight,
+            'cost_weight': self.q_params.cost_weight,
+        }
+
+        return QValueMultiPathResult(
+            best_path=found_paths[best_idx],
+            best_goal=found_goals[best_idx],
+            best_score=scores[best_idx],
+            best_q_value=found_q_values[best_idx],
+            best_cost=found_costs[best_idx],
+            all_paths=found_paths,
+            all_goals=found_goals,
+            all_scores=scores,
+            all_q_values=found_q_values,
+            all_costs=found_costs,
+            stats=stats
+        )
+
+    def _select_candidate_goals(self, q_field: np.ndarray,
+                                 target_mask: np.ndarray
+                                 ) -> List[Tuple[Tuple[int, ...], float]]:
+        """
+        在目标区域内按 Q 值降序选出候选终点。
+
+        为避免候选点聚集在同一高 Q 值区域，使用空间稀疏化：
+        候选点之间至少相隔 penalty_radius 个像素。
+
+        Returns:
+            [(goal_coord, q_value), ...] 按 Q 值降序排列
+        """
+        # 获取目标区域内所有有效点及其 Q 值
+        valid_indices = np.argwhere(target_mask)
+        if len(valid_indices) == 0:
+            return []
+
+        q_values = np.array([q_field[tuple(idx)] for idx in valid_indices])
+
+        # 按 Q 值降序排序
+        sorted_order = np.argsort(-q_values)
+
+        # 空间稀疏化
+        min_dist = self.q_params.penalty_radius
+        candidates = []
+        selected_coords = []
+
+        max_candidates = self.q_params.n_paths * 3  # 多选一些备用
+
+        for order_idx in sorted_order:
+            if len(candidates) >= max_candidates:
+                break
+
+            coord = tuple(valid_indices[order_idx].tolist())
+            q_val = float(q_values[order_idx])
+
+            # 检查与已选候选点的距离
+            too_close = False
+            for sel in selected_coords:
+                dist = np.sqrt(sum((a - b) ** 2 for a, b in zip(coord, sel)))
+                if dist < min_dist:
+                    too_close = True
+                    break
+
+            if not too_close:
+                candidates.append((coord, q_val))
+                selected_coords.append(coord)
+
+        return candidates
+
+    def _compute_scores(self, q_values: List[float],
+                         costs: List[float]) -> List[float]:
+        """
+        计算归一化综合得分
+
+        score = q_weight × Q_norm - cost_weight × cost_norm
+
+        Q_norm 和 cost_norm 各自归一化到 [0, 1]
+        """
+        q_arr = np.array(q_values)
+        cost_arr = np.array(costs)
+
+        # Q 值归一化
+        q_range = q_arr.max() - q_arr.min()
+        if q_range > 1e-10:
+            q_norm = (q_arr - q_arr.min()) / q_range
+        else:
+            q_norm = np.ones_like(q_arr)
+
+        # 代价归一化
+        cost_range = cost_arr.max() - cost_arr.min()
+        if cost_range > 1e-10:
+            cost_norm = (cost_arr - cost_arr.min()) / cost_range
+        else:
+            cost_norm = np.zeros_like(cost_arr)
+
+        scores = self.q_params.q_weight * q_norm - self.q_params.cost_weight * cost_norm
+        return scores.tolist()
+
+    def _apply_penalty(self, path: List[Tuple[float, ...]],
+                        penalty_masks: List[np.ndarray]) -> None:
+        """在所有金字塔层级施加路径惩罚"""
+        for level in range(self.n_levels):
+            shape = self.planner.pyramid.shapes[level]
+            scale = 2 ** level
+            scaled_radius = max(1, self.q_params.penalty_radius // scale)
+            step = max(1, scale)
+
+            for point in path[::step]:
+                idx = tuple(
+                    max(0, min(int(round(c / scale)), shape[d] - 1))
+                    for d, c in enumerate(point)
+                )
+                for neighbor in self._neighborhood_iterator(idx, scaled_radius, shape):
+                    dist = np.sqrt(sum((a - b) ** 2 for a, b in zip(idx, neighbor)))
+                    if dist > scaled_radius:
+                        continue
+                    if self.q_params.penalty_decay == 'gaussian':
+                        sigma = scaled_radius / 2.0
+                        decay = exp(-(dist ** 2) / (2 * sigma ** 2))
+                    else:
+                        decay = 1.0 - dist / scaled_radius if scaled_radius > 0 else 1.0
+                    penalty = 1.0 - self.q_params.penalty_weight * decay
+                    penalty_masks[level][neighbor] = min(
+                        penalty_masks[level][neighbor], penalty
+                    )
+
+    @staticmethod
+    def _neighborhood_iterator(center, radius, shape):
+        """生成邻域坐标"""
+        ndim = len(shape)
+        ranges = []
+        for d in range(ndim):
+            lo = max(0, center[d] - radius)
+            hi = min(shape[d] - 1, center[d] + radius)
+            ranges.append(range(lo, hi + 1))
+        if ndim == 3:
+            for z in ranges[0]:
+                for y in ranges[1]:
+                    for x in ranges[2]:
+                        yield (z, y, x)
+        elif ndim == 2:
+            for y in ranges[0]:
+                for x in ranges[1]:
+                    yield (y, x)
+
+    @staticmethod
+    def _compute_path_separation(path_a, path_b) -> float:
+        """计算两条路径平均最小距离"""
+        if not path_a or not path_b:
+            return 0.0
+        step_a = max(1, len(path_a) // 100)
+        step_b = max(1, len(path_b) // 100)
+        arr_a = np.array(path_a[::step_a])
+        arr_b = np.array(path_b[::step_b])
+        min_dists = []
+        for pa in arr_a:
+            dists = np.sqrt(np.sum((arr_b - pa) ** 2, axis=1))
+            min_dists.append(np.min(dists))
+        return float(np.mean(min_dists))
+
+
 def create_test_terrain_3d(shape: Tuple[int, int, int] = (30, 50, 50)) -> np.ndarray:
     """创建测试用3D地形"""
     nz, ny, nx = shape
@@ -1556,6 +2367,430 @@ def visualize_multi_path_results(terrain: np.ndarray,
     print("Result saved to multi_path_fmm_result.png")
 
 
+def visualize_waypoint_allocation(terrain: np.ndarray,
+                                   result: WaypointAllocationResult,
+                                   gas_params: GasDiffusionParams,
+                                   viscosity: np.ndarray):
+    """多机器人路径点分配结果可视化"""
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        print("Matplotlib not available, skipping visualization")
+        return
+
+    robot_colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan',
+                    'magenta', 'yellow']
+    n_robots = gas_params.n_robots
+    ndim = terrain.ndim
+
+    fig = plt.figure(figsize=(18, 12))
+
+    if ndim == 3:
+        mid_z = terrain.shape[0] // 2
+
+        # 1. 领土地图切片
+        ax1 = fig.add_subplot(2, 3, 1)
+        territory_slice = result.territory_map[mid_z]
+        # 自定义颜色映射: -1=白色, 0=red, 1=blue, ...
+        cmap_colors = ['white'] + robot_colors[:n_robots]
+        cmap = ListedColormap(cmap_colors)
+        im = ax1.imshow(territory_slice, cmap=cmap, origin='lower',
+                        vmin=-1, vmax=n_robots - 1, alpha=0.6)
+        # 标注路径点
+        for r in range(n_robots):
+            for wp in result.assignments.get(r, []):
+                if abs(wp[0] - mid_z) < 3:
+                    ax1.scatter(wp[2], wp[1], c=robot_colors[r % len(robot_colors)],
+                               s=120, marker='D', edgecolors='black', linewidth=1.5, zorder=5)
+        # 标注起点
+        for r, start in enumerate(gas_params.robot_starts):
+            if abs(start[0] - mid_z) < 3:
+                ax1.scatter(start[2], start[1], c=robot_colors[r % len(robot_colors)],
+                           s=150, marker='o', edgecolors='black', linewidth=2, zorder=6)
+        ax1.set_title(f'Territory Map (Z={mid_z} slice)')
+        ax1.set_xlabel('X')
+        ax1.set_ylabel('Y')
+
+        # 2. 地形 + 路径段
+        ax2 = fig.add_subplot(2, 3, 2)
+        im2 = ax2.imshow(terrain[mid_z], cmap='terrain', origin='lower')
+        plt.colorbar(im2, ax=ax2, label='Elevation')
+        for r in range(n_robots):
+            c = robot_colors[r % len(robot_colors)]
+            for seg_idx, seg in enumerate(result.robot_paths.get(r, [])):
+                if seg:
+                    path_array = np.array(seg)
+                    z_mask = np.abs(path_array[:, 0] - mid_z) < 3
+                    if np.any(z_mask):
+                        label = f'Robot {r}' if seg_idx == 0 else None
+                        ax2.plot(path_array[z_mask, 2], path_array[z_mask, 1],
+                                '-', color=c, linewidth=2, label=label)
+        ax2.legend(fontsize=7)
+        ax2.set_title(f'Terrain + Paths (Z={mid_z} slice)')
+        ax2.set_xlabel('X')
+        ax2.set_ylabel('Y')
+
+        # 3. 3D路径视图
+        ax3 = fig.add_subplot(2, 3, 3, projection='3d')
+        for r in range(n_robots):
+            c = robot_colors[r % len(robot_colors)]
+            for seg_idx, seg in enumerate(result.robot_paths.get(r, [])):
+                if seg and len(seg) > 1:
+                    path_array = np.array(seg)
+                    label = f'Robot {r}' if seg_idx == 0 else None
+                    ax3.plot3D(path_array[:, 2], path_array[:, 1], path_array[:, 0],
+                              '-', color=c, linewidth=2, label=label)
+            # 标注起点
+            s = gas_params.robot_starts[r]
+            ax3.scatter([s[2]], [s[1]], [s[0]], c=c, s=100, marker='o',
+                       edgecolors='black', zorder=5)
+            # 标注路径点
+            for wp in result.assignments.get(r, []):
+                ax3.scatter([wp[2]], [wp[1]], [wp[0]], c=c, s=80, marker='D',
+                           edgecolors='black', zorder=5)
+        ax3.set_xlabel('X')
+        ax3.set_ylabel('Y')
+        ax3.set_zlabel('Z')
+        ax3.set_title('3D Multi-Robot Paths')
+        ax3.legend(fontsize=7)
+
+        # 4. 粘滞系数 + 领土边界
+        ax4 = fig.add_subplot(2, 3, 4)
+        im4 = ax4.imshow(viscosity[mid_z], cmap='viridis', origin='lower')
+        plt.colorbar(im4, ax=ax4, label='Viscosity')
+        # 领土边界叠加
+        territory_slice = result.territory_map[mid_z]
+        # 简单边界检测
+        boundary = np.zeros_like(territory_slice, dtype=bool)
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            shifted = np.roll(np.roll(territory_slice, dy, axis=0), dx, axis=1)
+            boundary |= (territory_slice != shifted) & (territory_slice >= 0)
+        ax4.contour(boundary.astype(float), levels=[0.5], colors='white',
+                    linewidths=1.5)
+        ax4.set_title(f'Viscosity + Territory Boundary (Z={mid_z})')
+        ax4.set_xlabel('X')
+        ax4.set_ylabel('Y')
+
+    else:
+        # 2D 可视化
+        # 1. 领土地图
+        ax1 = fig.add_subplot(2, 3, 1)
+        cmap_colors = ['white'] + robot_colors[:n_robots]
+        cmap = ListedColormap(cmap_colors)
+        ax1.imshow(result.territory_map, cmap=cmap, origin='lower',
+                   vmin=-1, vmax=n_robots - 1, alpha=0.6)
+        for r in range(n_robots):
+            for wp in result.assignments.get(r, []):
+                ax1.scatter(wp[1], wp[0], c=robot_colors[r % len(robot_colors)],
+                           s=120, marker='D', edgecolors='black', linewidth=1.5, zorder=5)
+        for r, start in enumerate(gas_params.robot_starts):
+            ax1.scatter(start[1], start[0], c=robot_colors[r % len(robot_colors)],
+                       s=150, marker='o', edgecolors='black', linewidth=2, zorder=6)
+        ax1.set_title('Territory Map')
+
+        # 2. 地形 + 路径段
+        ax2 = fig.add_subplot(2, 3, 2)
+        im2 = ax2.imshow(terrain, cmap='terrain', origin='lower')
+        plt.colorbar(im2, ax=ax2, label='Elevation')
+        for r in range(n_robots):
+            c = robot_colors[r % len(robot_colors)]
+            for seg_idx, seg in enumerate(result.robot_paths.get(r, [])):
+                if seg:
+                    path_array = np.array(seg)
+                    label = f'Robot {r}' if seg_idx == 0 else None
+                    ax2.plot(path_array[:, 1], path_array[:, 0],
+                            '-', color=c, linewidth=2, label=label)
+        ax2.legend(fontsize=7)
+        ax2.set_title('Terrain + Paths')
+
+        # 3. 粘滞系数
+        ax3 = fig.add_subplot(2, 3, 3)
+        im3 = ax3.imshow(viscosity, cmap='viridis', origin='lower')
+        plt.colorbar(im3, ax=ax3, label='Viscosity')
+        ax3.set_title('Viscosity Field')
+
+        # 4. 领土边界
+        ax4 = fig.add_subplot(2, 3, 4)
+        ax4.imshow(terrain, cmap='terrain', origin='lower', alpha=0.5)
+        boundary = np.zeros_like(result.territory_map, dtype=bool)
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            shifted = np.roll(np.roll(result.territory_map, dy, axis=0), dx, axis=1)
+            boundary |= (result.territory_map != shifted) & (result.territory_map >= 0)
+        ax4.contour(boundary.astype(float), levels=[0.5], colors='red', linewidths=1.5)
+        ax4.set_title('Territory Boundary')
+
+    # 5. 时间线（各路径点到达时间）
+    ax5 = fig.add_subplot(2, 3, 5)
+    for r in range(n_robots):
+        times = result.arrival_times.get(r, [])
+        if times:
+            ax5.barh([f'R{r}-WP{i}' for i in range(len(times))],
+                     times, color=robot_colors[r % len(robot_colors)], alpha=0.8)
+    ax5.set_xlabel('Arrival Time (phi)')
+    ax5.set_title('Waypoint Arrival Timeline')
+
+    # 6. 统计面板
+    ax6 = fig.add_subplot(2, 3, 6)
+    ax6.axis('off')
+
+    stats_text = "Waypoint Allocation Statistics:\n"
+    stats_text += f"Robots: {result.stats.get('n_robots', 0)}\n"
+    stats_text += f"Waypoints: {result.stats.get('n_waypoints_assigned', 0)}"
+    stats_text += f" / {result.stats.get('n_waypoints_total', 0)}\n"
+    stats_text += f"Alloc time: {result.stats.get('allocation_time', 0):.4f}s\n"
+    stats_text += f"Path plan time: {result.stats.get('path_planning_time', 0):.4f}s\n"
+    stats_text += f"Total time: {result.stats.get('total_time', 0):.4f}s\n"
+    stats_text += "\nPer-Robot Details:\n"
+
+    for r in range(n_robots):
+        per = result.stats.get('per_robot', {}).get(r, {})
+        n_wp = per.get('n_waypoints', 0)
+        n_seg = per.get('n_segments', 0)
+        times_str = ', '.join(f'{t:.1f}' for t in per.get('arrival_times', []))
+        stats_text += f"  Robot {r}: {n_wp} WPs, {n_seg} segs\n"
+        if times_str:
+            stats_text += f"    t=[{times_str}]\n"
+
+    stats_text += "\nAssignment Order:\n"
+    for robot_id, wp_idx in result.assignment_order:
+        wp = gas_params.waypoints[wp_idx]
+        stats_text += f"  R{robot_id} -> WP{wp_idx} {wp}\n"
+
+    ax6.text(0.02, 0.98, stats_text, transform=ax6.transAxes,
+             fontsize=8, verticalalignment='top', fontfamily='monospace')
+    ax6.set_title('Statistics')
+
+    plt.suptitle('Multi-Robot Waypoint Allocation (Immiscible Gas Diffusion + Huygens)',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('waypoint_allocation_result.png', dpi=150)
+    plt.show()
+    print("Result saved to waypoint_allocation_result.png")
+
+
+    plt.savefig('waypoint_allocation_result.png', dpi=150)
+    plt.show()
+    print("Result saved to waypoint_allocation_result.png")
+
+
+def visualize_q_value_results(terrain: np.ndarray,
+                                q_field: np.ndarray,
+                                target_mask: np.ndarray,
+                                result: QValueMultiPathResult):
+    """Q值多路径规划结果可视化"""
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        print("Matplotlib not available, skipping visualization")
+        return
+
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
+    ndim = terrain.ndim
+    fig = plt.figure(figsize=(18, 12))
+
+    if ndim == 3:
+        mid_z = terrain.shape[0] // 2
+
+        # 1. Q值场 + 目标区域 + 候选路径
+        ax1 = fig.add_subplot(2, 3, 1)
+        q_slice = q_field[mid_z].copy()
+        mask_slice = target_mask[mid_z]
+        # Q值场只在目标区域内显示
+        q_display = np.full_like(q_slice, np.nan)
+        q_display[mask_slice] = q_slice[mask_slice]
+        im1 = ax1.imshow(q_display, cmap='hot', origin='lower', alpha=0.8)
+        plt.colorbar(im1, ax=ax1, label='Q Value')
+        # 目标区域边界
+        ax1.contour(mask_slice.astype(float), levels=[0.5], colors='lime',
+                    linewidths=2, linestyles='--')
+        # 候选终点
+        for i, goal in enumerate(result.all_goals):
+            if abs(goal[0] - mid_z) < 3:
+                is_best = (i == result.stats.get('best_index', -1))
+                marker = '*' if is_best else 'o'
+                size = 200 if is_best else 80
+                ax1.scatter(goal[2], goal[1], c=colors[i % len(colors)],
+                           s=size, marker=marker, edgecolors='black', linewidth=1.5, zorder=5)
+        ax1.set_title(f'Q-Value Field + Goals (Z={mid_z})')
+        ax1.set_xlabel('X')
+        ax1.set_ylabel('Y')
+
+        # 2. 地形 + 所有候选路径（最优路径加粗）
+        ax2 = fig.add_subplot(2, 3, 2)
+        im2 = ax2.imshow(terrain[mid_z], cmap='terrain', origin='lower')
+        plt.colorbar(im2, ax=ax2, label='Elevation')
+        best_idx = result.stats.get('best_index', 0)
+        for i, path in enumerate(result.all_paths):
+            if path:
+                path_array = np.array(path)
+                z_mask = np.abs(path_array[:, 0] - mid_z) < 3
+                if np.any(z_mask):
+                    is_best = (i == best_idx)
+                    lw = 3 if is_best else 1.5
+                    alpha = 1.0 if is_best else 0.5
+                    label = f'Path {i} (Q={result.all_q_values[i]:.1f}, score={result.all_scores[i]:.2f})'
+                    if is_best:
+                        label += ' [BEST]'
+                    ax2.plot(path_array[z_mask, 2], path_array[z_mask, 1],
+                            '-', color=colors[i % len(colors)],
+                            linewidth=lw, alpha=alpha, label=label)
+        # 起点
+        if result.best_path:
+            sp = result.best_path[0]
+            ax2.scatter(sp[2], sp[1], c='lime', s=150, marker='o',
+                       edgecolors='black', linewidth=2, zorder=6, label='Start')
+        ax2.legend(fontsize=6, loc='upper left')
+        ax2.set_title(f'Terrain + Candidate Paths (Z={mid_z})')
+        ax2.set_xlabel('X')
+        ax2.set_ylabel('Y')
+
+        # 3. 3D 最优路径
+        ax3 = fig.add_subplot(2, 3, 3, projection='3d')
+        if result.best_path:
+            path_array = np.array(result.best_path)
+            ax3.plot3D(path_array[:, 2], path_array[:, 1], path_array[:, 0],
+                      'r-', linewidth=3, label='Best Path')
+            ax3.scatter([path_array[0, 2]], [path_array[0, 1]], [path_array[0, 0]],
+                       c='lime', s=150, marker='o', zorder=5, label='Start')
+            bg = result.best_goal
+            ax3.scatter([bg[2]], [bg[1]], [bg[0]],
+                       c='gold', s=200, marker='*', zorder=5,
+                       label=f'Best Goal (Q={result.best_q_value:.1f})')
+        # 其他路径（透明）
+        for i, path in enumerate(result.all_paths):
+            if i != best_idx and path:
+                pa = np.array(path)
+                ax3.plot3D(pa[:, 2], pa[:, 1], pa[:, 0],
+                          '-', color=colors[i % len(colors)], linewidth=1, alpha=0.4)
+        ax3.set_xlabel('X')
+        ax3.set_ylabel('Y')
+        ax3.set_zlabel('Z')
+        ax3.set_title('3D Best Path')
+        ax3.legend(fontsize=7)
+
+        # 4. 得分对比柱状图
+        ax4 = fig.add_subplot(2, 3, 4)
+        n_paths = len(result.all_paths)
+        x_pos = np.arange(n_paths)
+        bar_width = 0.35
+        bars_q = ax4.bar(x_pos - bar_width / 2, result.all_q_values, bar_width,
+                         label='Q Value (norm)', color='steelblue', alpha=0.8)
+        # 归一化代价（反转：低代价 = 高条形）
+        if result.all_costs:
+            max_cost = max(result.all_costs)
+            inv_costs = [1.0 - c / max_cost if max_cost > 0 else 0 for c in result.all_costs]
+        else:
+            inv_costs = []
+        bars_c = ax4.bar(x_pos + bar_width / 2, inv_costs, bar_width,
+                         label='1 - Cost (norm)', color='coral', alpha=0.8)
+        # 标注最优
+        if 0 <= best_idx < n_paths:
+            ax4.annotate('BEST', (x_pos[best_idx], max(result.all_q_values[best_idx],
+                         inv_costs[best_idx]) + 0.05),
+                        ha='center', fontweight='bold', color='red')
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels([f'P{i}' for i in range(n_paths)])
+        ax4.set_ylabel('Value')
+        ax4.set_title('Q-Value vs Cost Tradeoff')
+        ax4.legend(fontsize=8)
+
+    else:
+        # 2D 可视化
+        ax1 = fig.add_subplot(2, 3, 1)
+        q_display = np.full_like(q_field, np.nan, dtype=float)
+        q_display[target_mask] = q_field[target_mask]
+        im1 = ax1.imshow(q_display, cmap='hot', origin='lower', alpha=0.8)
+        plt.colorbar(im1, ax=ax1, label='Q Value')
+        ax1.contour(target_mask.astype(float), levels=[0.5], colors='lime', linewidths=2)
+        for i, goal in enumerate(result.all_goals):
+            is_best = (i == result.stats.get('best_index', -1))
+            marker = '*' if is_best else 'o'
+            size = 200 if is_best else 80
+            ax1.scatter(goal[1], goal[0], c=colors[i % len(colors)],
+                       s=size, marker=marker, edgecolors='black', zorder=5)
+        ax1.set_title('Q-Value Field + Goals')
+
+        ax2 = fig.add_subplot(2, 3, 2)
+        im2 = ax2.imshow(terrain, cmap='terrain', origin='lower')
+        plt.colorbar(im2, ax=ax2, label='Elevation')
+        best_idx = result.stats.get('best_index', 0)
+        for i, path in enumerate(result.all_paths):
+            if path:
+                pa = np.array(path)
+                is_best = (i == best_idx)
+                lw = 3 if is_best else 1.5
+                alpha = 1.0 if is_best else 0.5
+                label = f'P{i} (Q={result.all_q_values[i]:.1f})'
+                if is_best:
+                    label += ' [BEST]'
+                ax2.plot(pa[:, 1], pa[:, 0], '-', color=colors[i % len(colors)],
+                        linewidth=lw, alpha=alpha, label=label)
+        ax2.legend(fontsize=6)
+        ax2.set_title('Terrain + Candidate Paths')
+
+        ax3 = fig.add_subplot(2, 3, 3)
+        ax3.imshow(terrain, cmap='terrain', origin='lower', alpha=0.5)
+        ax3.set_title('Viscosity Field')
+
+        ax4 = fig.add_subplot(2, 3, 4)
+        n_paths = len(result.all_paths)
+        x_pos = np.arange(n_paths)
+        ax4.bar(x_pos, result.all_scores, color=[colors[i % len(colors)] for i in range(n_paths)])
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels([f'P{i}' for i in range(n_paths)])
+        ax4.set_title('Composite Scores')
+
+    # 5. 综合得分排名
+    ax5 = fig.add_subplot(2, 3, 5)
+    if result.all_scores:
+        sorted_indices = np.argsort(result.all_scores)[::-1]
+        y_pos = np.arange(len(sorted_indices))
+        bar_colors = [colors[i % len(colors)] for i in sorted_indices]
+        bars = ax5.barh(y_pos, [result.all_scores[i] for i in sorted_indices],
+                        color=bar_colors, alpha=0.8)
+        ax5.set_yticks(y_pos)
+        ax5.set_yticklabels([f'Path {i}' for i in sorted_indices])
+        ax5.set_xlabel('Composite Score')
+        ax5.set_title('Score Ranking')
+        ax5.invert_yaxis()
+
+    # 6. 统计面板
+    ax6 = fig.add_subplot(2, 3, 6)
+    ax6.axis('off')
+
+    stats_text = "Q-Value Multi-Path Statistics:\n"
+    stats_text += f"Candidates evaluated: {result.stats.get('n_candidates', 0)}\n"
+    stats_text += f"Paths found: {result.stats.get('n_paths_found', 0)}\n"
+    stats_text += f"Q weight: {result.stats.get('q_weight', 0)}\n"
+    stats_text += f"Cost weight: {result.stats.get('cost_weight', 0)}\n"
+    stats_text += f"Total time: {result.stats.get('total_time', 0):.4f}s\n"
+    stats_text += f"\nBest Path (#{result.stats.get('best_index', 0)}):\n"
+    stats_text += f"  Goal: {result.best_goal}\n"
+    stats_text += f"  Q Value: {result.best_q_value:.2f}\n"
+    stats_text += f"  Path Cost: {result.best_cost:.2f}\n"
+    stats_text += f"  Score: {result.best_score:.3f}\n"
+    stats_text += f"\nAll Paths:\n"
+    for i in range(len(result.all_paths)):
+        tag = " <-- BEST" if i == result.stats.get('best_index', -1) else ""
+        stats_text += f"  P{i}: Q={result.all_q_values[i]:.1f}"
+        stats_text += f", cost={result.all_costs[i]:.1f}"
+        stats_text += f", score={result.all_scores[i]:.2f}{tag}\n"
+
+    ax6.text(0.02, 0.98, stats_text, transform=ax6.transAxes,
+             fontsize=8, verticalalignment='top', fontfamily='monospace')
+    ax6.set_title('Statistics')
+
+    plt.suptitle('Q-Value Guided Multi-Path Planning (max Q with cost tradeoff)',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('q_value_multipath_result.png', dpi=150)
+    plt.show()
+    print("Result saved to q_value_multipath_result.png")
+
+
 def main():
     """主函数：测试分层路径规划"""
     print("=" * 60)
@@ -1696,11 +2931,163 @@ def main():
     except Exception as e:
         print(f"   Visualization skipped: {e}")
 
+    # ======== 多机器人路径点分配 Demo ========
+    print("\n" + "=" * 60)
+    print("Multi-Robot Waypoint Allocation Demo")
+    print("(Immiscible Gas Diffusion + Huygens Principle)")
+    print("=" * 60)
+
+    # 定义 3 个机器人起点和 6 个路径点
+    robot_starts = [
+        (2, 5, 5),      # Robot 0: 左下前方
+        (2, 45, 5),     # Robot 1: 左上前方
+        (2, 25, 45),    # Robot 2: 右中前方
+    ]
+    waypoints = [
+        (10, 15, 15),   # WP0
+        (10, 35, 15),   # WP1
+        (10, 25, 25),   # WP2
+        (20, 10, 40),   # WP3
+        (20, 40, 40),   # WP4
+        (15, 25, 10),   # WP5
+    ]
+
+    gas_params = GasDiffusionParams(
+        n_robots=3,
+        robot_starts=robot_starts,
+        waypoints=waypoints,
+        max_waypoints_per_robot=None  # 不限制
+    )
+
+    print(f"\n8. Allocating {len(waypoints)} waypoints to {gas_params.n_robots} robots...")
+    print(f"   Robot starts: {robot_starts}")
+    print(f"   Waypoints: {waypoints}")
+
+    allocator = MultiRobotWaypointAllocator(
+        terrain=terrain,
+        fog_data=fog_data,
+        n_levels=3,
+        viscosity_params=params,
+        gas_params=gas_params,
+        spacing=(1.0, 1.0, 1.0)
+    )
+
+    alloc_result = allocator.allocate()
+
+    print(f"\n   Allocation results:")
+    print(f"   Total time: {alloc_result.stats.get('total_time', 0):.4f}s")
+    print(f"   Waypoints assigned: {alloc_result.stats.get('n_waypoints_assigned', 0)}"
+          f" / {alloc_result.stats.get('n_waypoints_total', 0)}")
+
+    for r in range(gas_params.n_robots):
+        wps = alloc_result.assignments.get(r, [])
+        times = alloc_result.arrival_times.get(r, [])
+        print(f"   Robot {r}: {len(wps)} waypoints")
+        for i, (wp, t) in enumerate(zip(wps, times)):
+            print(f"     WP {wp} @ t={t:.2f}")
+
+    print(f"\n   Assignment order (global):")
+    for robot_id, wp_idx in alloc_result.assignment_order:
+        wp = waypoints[wp_idx]
+        t = alloc_result.arrival_times[robot_id][
+            alloc_result.assignments[robot_id].index(wp)]
+        print(f"     Robot {robot_id} -> WP{wp_idx} {wp} @ t={t:.2f}")
+
+    print("\n9. Generating waypoint allocation visualization...")
+    try:
+        visualize_waypoint_allocation(terrain, alloc_result, gas_params, viscosity)
+    except Exception as e:
+        print(f"   Visualization skipped: {e}")
+
+    # ======== Q值多路径规划 Demo ========
+    print("\n" + "=" * 60)
+    print("Q-Value Guided Multi-Path Planning Demo")
+    print("(Find highest-scoring goal in target region)")
+    print("=" * 60)
+
+    # 创建 Q 值场：在目标区域内模拟一个得分分布
+    # 目标区域：终点附近的一个区域
+    print("\n10. Creating Q-value field and target region...")
+    terrain_shape = terrain.shape
+    q_field = np.zeros(terrain_shape, dtype=np.float64)
+    target_mask = np.zeros(terrain_shape, dtype=bool)
+
+    # 目标区域：z=20-28, y=35-48, x=35-48 的立方体区域
+    target_mask[20:28, 35:48, 35:48] = True
+
+    # Q值场：在目标区域内模拟多个高分点（比如多个感兴趣目标）
+    # 高分点1：(24, 40, 40) Q=10.0 — 最高分但���离起点
+    # 高分点2：(22, 38, 38) Q=7.0 — 中等分
+    # 高分点3：(21, 42, 45) Q=9.0 — 高分，位置不同
+    for z in range(terrain_shape[0]):
+        for y in range(terrain_shape[1]):
+            for x in range(terrain_shape[2]):
+                if target_mask[z, y, x]:
+                    # 基础 Q 值：距离目标区域中心的函数
+                    d1 = np.sqrt((z - 24)**2 + (y - 40)**2 + (x - 40)**2)
+                    d2 = np.sqrt((z - 22)**2 + (y - 38)**2 + (x - 38)**2)
+                    d3 = np.sqrt((z - 21)**2 + (y - 42)**2 + (x - 45)**2)
+                    q_field[z, y, x] = (
+                        10.0 * np.exp(-d1**2 / 18.0) +
+                        7.0 * np.exp(-d2**2 / 12.0) +
+                        9.0 * np.exp(-d3**2 / 15.0) +
+                        np.random.uniform(0, 0.5)  # 微小随机扰动
+                    )
+
+    print(f"   Target region size: {target_mask.sum()} voxels")
+    print(f"   Q-value range in target: [{q_field[target_mask].min():.2f}, {q_field[target_mask].max():.2f}]")
+
+    q_params = QValueMultiPathParams(
+        n_paths=5,
+        q_weight=1.0,
+        cost_weight=0.5,
+        penalty_weight=0.4,
+        penalty_radius=5,
+        min_path_separation=6.0,
+        max_cost_ratio=5.0
+    )
+
+    q_planner = QValueMultiPathPlanner(
+        terrain=terrain,
+        fog_data=fog_data,
+        n_levels=3,
+        viscosity_params=params,
+        q_params=q_params,
+        spacing=(1.0, 1.0, 1.0)
+    )
+
+    print(f"\n11. Planning paths from {start} to target region (max Q)...")
+    q_result = q_planner.plan(start, q_field, target_mask)
+
+    if q_result.stats.get('success'):
+        print(f"   Paths found: {q_result.stats.get('n_paths_found', 0)}")
+        print(f"   Total time: {q_result.stats.get('total_time', 0):.4f}s")
+        print(f"\n   Best path:")
+        print(f"     Goal: {q_result.best_goal}")
+        print(f"     Q value: {q_result.best_q_value:.2f}")
+        print(f"     Path cost: {q_result.best_cost:.2f}")
+        print(f"     Composite score: {q_result.best_score:.3f}")
+        print(f"\n   All candidates:")
+        for i in range(len(q_result.all_paths)):
+            tag = " <-- BEST" if i == q_result.stats.get('best_index') else ""
+            print(f"     P{i}: goal={q_result.all_goals[i]}, "
+                  f"Q={q_result.all_q_values[i]:.2f}, "
+                  f"cost={q_result.all_costs[i]:.2f}, "
+                  f"score={q_result.all_scores[i]:.3f}{tag}")
+    else:
+        print(f"   Failed: {q_result.stats.get('error', 'unknown')}")
+
+    print("\n12. Generating Q-value multi-path visualization...")
+    try:
+        visualize_q_value_results(terrain, q_field, target_mask, q_result)
+    except Exception as e:
+        print(f"   Visualization skipped: {e}")
+
     print("\n" + "=" * 60)
     print("All demos completed successfully!")
     print("=" * 60)
 
-    return result
+    return q_result
 
 
 if __name__ == "__main__":
