@@ -307,9 +307,19 @@ class OnlineReplanner:
             start: Tuple[int, ...],
             goal: Tuple[int, ...],
             t_max: float = 120.0,
+            max_iterations: int = 5000,
+            stuck_distance: float = 0.05,
+            stuck_window: int = 10,
             on_step: Optional[Callable[[float, Tuple[float, ...]], None]] = None,
             ) -> TrajectoryRecord:
-        """执行闭环仿真。"""
+        """执行闭环仿真。
+
+        终止条件:
+          * 到达 goal (距离 < 1.5 voxel)
+          * t >= t_max
+          * 迭代数 >= max_iterations
+          * 检测到"卡住"：最近 stuck_window 步累积位移 < stuck_distance
+        """
         rec = TrajectoryRecord()
         t = 0.0
         position = tuple(float(s) for s in start)
@@ -330,15 +340,18 @@ class OnlineReplanner:
             rec.final_distance_to_goal = _euclid(position, goal)
             return rec
 
-        # 主循环
         last_replan_t = 0.0
         path_idx = 0
-        while t < t_max:
-            # 推进一步：朝 path 下一个目标点移动 vmax * dt 米
+        iteration = 0
+        max_replans = 12  # 上限：避免无限循环
+
+        while t < t_max and iteration < max_iterations:
+            iteration += 1
             if path_idx >= len(path) - 1:
-                # 已到达当前路径末端；如果离 goal 仍远，触发重规划，否则结束
                 if _euclid(position, goal) < 1.5:
                     rec.success = True
+                    break
+                if len(rec.replan_events) >= max_replans:
                     break
                 fog_now = self.weather.get_fog(t)
                 path, plan_time = self._plan_from(position, goal, fog_now)
@@ -378,6 +391,18 @@ class OnlineReplanner:
                 rec.success = True
                 break
 
+            # 卡住检测
+            if len(rec.waypoints) > stuck_window:
+                tail = rec.waypoints[-stuck_window:]
+                disp = float(np.linalg.norm(
+                    np.array(tail[-1]) - np.array(tail[0])))
+                if disp < stuck_distance:
+                    rec.replan_events.append(ReplanEvent(
+                        t=t, position=position, reason="stuck",
+                        new_path_length=0, plan_time_s=0.0,
+                    ))
+                    break
+
             # 检测天气变化
             fog_now = self.weather.get_fog(t)
             denom = float(np.linalg.norm(self._last_fog) + 1e-9)
@@ -386,7 +411,7 @@ class OnlineReplanner:
             should, reason = self.trigger.should_replan(
                 t, last_replan_t, fog_delta, speed_drop
             )
-            if should:
+            if should and len(rec.replan_events) < max_replans:
                 new_path, plan_time = self._plan_from(position, goal, fog_now)
                 rec.total_replan_time_s += plan_time
                 rec.replan_events.append(ReplanEvent(
@@ -400,7 +425,6 @@ class OnlineReplanner:
                     path_idx = 0
 
         rec.final_distance_to_goal = _euclid(position, goal)
-        # 最终可行性
         rec.feasibility = check_path_feasibility(
             rec.waypoints, self.kin, self.spacing
         )
