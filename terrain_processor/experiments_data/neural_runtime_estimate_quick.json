@@ -1,0 +1,189 @@
+{
+  "rows": [
+    {
+      "name": "small_2r8w",
+      "mode": "imitation",
+      "d_model": 32,
+      "n_heads": 4,
+      "n_layers": 1,
+      "robots": 2,
+      "waypoints": 8,
+      "batch_size": 8,
+      "params": 65286,
+      "mean_step_s": 0.018024399993009865,
+      "median_step_s": 0.018024399993009865,
+      "mean_infer_s": 0.00024364374985452741,
+      "lr_first_steps": [
+        1.2000202237296375e-05
+      ],
+      "loss_first_steps": [
+        0.607539713382721
+      ]
+    },
+    {
+      "name": "small_2r8w",
+      "mode": "rl",
+      "d_model": 32,
+      "n_heads": 4,
+      "n_layers": 1,
+      "robots": 2,
+      "waypoints": 8,
+      "batch_size": 8,
+      "params": 65286,
+      "mean_step_s": 0.06168679997790605,
+      "median_step_s": 0.06168679997790605,
+      "mean_infer_s": NaN,
+      "lr_first_steps": [
+        0.0003
+      ],
+      "loss_first_steps": [
+        0.9848966002464294
+      ]
+    },
+    {
+      "name": "small_4r16w",
+      "mode": "imitation",
+      "d_model": 48,
+      "n_heads": 4,
+      "n_layers": 2,
+      "robots": 4,
+      "waypoints": 16,
+      "batch_size": 6,
+      "params": 164598,
+      "mean_step_s": 0.022879199997987598,
+      "median_step_s": 0.022879199997987598,
+      "mean_infer_s": 0.0006460333340025196,
+      "lr_first_steps": [
+        1.2000202237296375e-05
+      ],
+      "loss_first_steps": [
+        1.8374987840652466
+      ]
+    },
+    {
+      "name": "small_4r16w",
+      "mode": "rl",
+      "d_model": 48,
+      "n_heads": 4,
+      "n_layers": 2,
+      "robots": 4,
+      "waypoints": 16,
+      "batch_size": 6,
+      "params": 164598,
+      "mean_step_s": 0.025361400010297075,
+      "median_step_s": 0.025361400010297075,
+      "mean_infer_s": NaN,
+      "lr_first_steps": [
+        0.0003
+      ],
+      "loss_first_steps": [
+        1.3079899549484253
+      ]
+    },
+    {
+      "name": "small_6r32w",
+      "mode": "imitation",
+      "d_model": 64,
+      "n_heads": 4,
+      "n_layers": 2,
+      "robots": 6,
+      "waypoints": 32,
+      "batch_size": 4,
+      "params": 263590,
+      "mean_step_s": 0.017568100010976195,
+      "median_step_s": 0.017568100010976195,
+      "mean_infer_s": 0.0007086125042405911,
+      "lr_first_steps": [
+        1.2000202237296375e-05
+      ],
+      "loss_first_steps": [
+        2.8551084995269775
+      ]
+    },
+    {
+      "name": "small_6r32w",
+      "mode": "rl",
+      "d_model": 64,
+      "n_heads": 4,
+      "n_layers": 2,
+      "robots": 6,
+      "waypoints": 32,
+      "batch_size": 4,
+      "params": 263590,
+      "mean_step_s": 0.016326999990269542,
+      "median_step_s": 0.016326999990269542,
+      "mean_infer_s": NaN,
+      "lr_first_steps": [
+        0.0003
+      ],
+      "loss_first_steps": [
+        2.0064175128936768
+      ]
+    },
+    {
+      "name": "target_probe",
+      "mode": "imitation",
+      "d_model": 64,
+      "n_heads": 8,
+      "n_layers": 2,
+      "robots": 6,
+      "waypoints": 32,
+      "batch_size": 4,
+      "params": 263722,
+      "mean_step_s": 0.01490945000841748,
+      "median_step_s": 0.01490945000841748,
+      "mean_infer_s": 0.0006725374987581745,
+      "lr_first_steps": [
+        1.2000202237296375e-05,
+        1.2000455033783623e-05
+      ],
+      "loss_first_steps": [
+        2.165252208709717,
+        2.137338876724243
+      ]
+    },
+    {
+      "name": "target_probe",
+      "mode": "rl",
+      "d_model": 64,
+      "n_heads": 8,
+      "n_layers": 2,
+      "robots": 6,
+      "waypoints": 32,
+      "batch_size": 4,
+      "params": 263722,
+      "mean_step_s": 0.02524585000355728,
+      "median_step_s": 0.02524585000355728,
+      "mean_infer_s": NaN,
+      "lr_first_steps": [
+        0.0003,
+        0.0003
+      ],
+      "loss_first_steps": [
+        1.6465290784835815,
+        1.3611489534378052
+      ]
+    }
+  ],
+  "estimate": {
+    "target": "target_probe",
+    "steps_per_epoch": 1250,
+    "target_step_s": 0.01490945000841748,
+    "target_infer_s_per_case": 0.0006725374987581745,
+    "imitation_train_s": 559.1043753156555,
+    "imitation_val_s": 2.0176124962745234,
+    "imitation_total_s": 561.12198781193,
+    "rl_train_s": 193.8881280273199,
+    "combined_s": 755.0101158392499,
+    "human": {
+      "imitation_total": "9.4min",
+      "rl_train": "3.2min",
+      "combined": "12.6min",
+      "inference_per_case": "0.0s"
+    },
+    "lr_first_steps": [
+      1.2000202237296375e-05,
+      1.2000455033783623e-05
+    ]
+  }
+}
