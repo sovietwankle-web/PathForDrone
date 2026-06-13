@@ -56,6 +56,15 @@ class GasDiffusionParams:
     robot_starts: List[Tuple[int, ...]] = field(default_factory=list)  # 各机器人起点
     waypoints: List[Tuple[int, ...]] = field(default_factory=list)     # 待分配路径点
     max_waypoints_per_robot: Optional[int] = None           # 每机器人最大路径点数（None=不限）
+    n_batches: Optional[int] = None                         # 往返批次数（None=普通单程分配）
+    return_to_start: bool = False                           # 每批是否从起点出发并返回起点
+    max_waypoints_per_batch: Optional[int] = None            # 每个机器人每批最多路径点数
+    batch_local_search_iterations: int = 2                   # 批次分配局部搜索轮数
+    batch_use_dp_partition: bool = True                      # 是否用DP切分批次（False=贪心）
+    batch_allow_cross_robot_refine: bool = True              # 局部搜索是否允许跨机器人搬移点
+    batch_align_sync_slots: bool = True                      # 是否对齐批次槽以降低同步出发总时间
+    batch_exact_tsp_limit: int = 7                           # 批内点数不超过该值时精确枚举最短往返顺序
+    batch_objective: str = 'sync'                            # 优化目标: 'sync' 或 'independent'
 
 
 @dataclass
@@ -71,6 +80,14 @@ class WaypointAllocationResult:
     # robot_id → 各路径点到达时间
     territory_map: Optional[np.ndarray] = None
     # 领土地图：每个像素属于哪个机器人 (-1=未占领)
+    time_map: Optional[np.ndarray] = None
+    # 首次扩散到达时间图（未到达为 inf）
+    batch_assignments: Dict[int, List[List[Tuple[int, ...]]]] = field(default_factory=dict)
+    # robot_id → batch_id → 本批路径点
+    batch_paths: Dict[int, List[List[List[Tuple[float, ...]]]]] = field(default_factory=dict)
+    # robot_id → batch_id → 路径段列表 [base→wp..., last→base]
+    batch_durations: Dict[int, List[float]] = field(default_factory=dict)
+    # robot_id → 每批估计执行时间
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1369,6 +1386,12 @@ class CompetitiveFMM:
         self.spacing = spacing
         self.shape = speed_field.shape
         self.ndim = speed_field.ndim
+        self.last_phi: Dict[Tuple[int, ...], float] = {}
+        self.last_owner: Dict[Tuple[int, ...], int] = {}
+        self.last_status: Dict[Tuple[int, ...], int] = {}
+        self.last_time_map: Optional[np.ndarray] = None
+        self.last_owner_map: Optional[np.ndarray] = None
+        self.last_passed_mask: Optional[np.ndarray] = None
 
     def solve(self, robot_starts: List[Tuple[int, ...]],
               waypoints: List[Tuple[int, ...]],
@@ -1507,6 +1530,23 @@ class CompetitiveFMM:
                         heapq.heappush(heap, (new_phi, counter, neighbor, robot_id))
                         counter += 1
 
+        # 保留首次扩散时"曾经通过"的点、归属和到达时间，供批次划分复用。
+        self.last_phi = phi
+        self.last_owner = owner
+        self.last_status = status
+        time_map = np.full(self.shape, np.inf, dtype=np.float64)
+        owner_map = np.full(self.shape, -1, dtype=np.int32)
+        passed_mask = np.zeros(self.shape, dtype=bool)
+        for point, phi_value in phi.items():
+            if status.get(point) != self.ACCEPTED:
+                continue
+            time_map[point] = phi_value
+            owner_map[point] = owner.get(point, -1)
+            passed_mask[point] = True
+        self.last_time_map = time_map
+        self.last_owner_map = owner_map
+        self.last_passed_mask = passed_mask
+
         return assignments, territory_map, arrival_times, assignment_order
 
     def _get_neighbors(self, point: Tuple[int, ...]) -> List[Tuple[int, ...]]:
@@ -1602,6 +1642,619 @@ class CompetitiveFMM:
         return (b + discriminant ** 0.5) / a
 
 
+class BatchRoundTripAllocator:
+    """
+    基于一次竞争性扩散结果的批次往返分配器。
+
+    输入每个路径点的首达机器人和首达时间，把任务拆成 n 个出发-返回批次，
+    优化目标近似为所有机器人/批次的最大完成时间（makespan）最小。
+    """
+
+    def __init__(self, speed_field: np.ndarray,
+                 robot_starts: List[Tuple[int, ...]],
+                 waypoints: List[Tuple[int, ...]],
+                 initial_assignments: Dict[int, List[Tuple[int, ...]]],
+                 arrival_times: Dict[int, List[float]],
+                 spacing: Tuple[float, ...],
+                 n_batches: int,
+                 max_waypoints_per_batch: Optional[int] = None,
+                 local_search_iterations: int = 2,
+                 use_dp_partition: bool = True,
+                 allow_cross_robot_refine: bool = True,
+                 align_sync_slots: bool = True,
+                 exact_tsp_limit: int = 7,
+                 objective: str = 'sync'):
+        self.speed_field = speed_field
+        self.robot_starts = [tuple(p) for p in robot_starts]
+        self.waypoints = [tuple(p) for p in waypoints]
+        self.initial_assignments = initial_assignments
+        self.arrival_times = arrival_times
+        self.spacing = spacing
+        self.n_batches = max(1, int(n_batches))
+        self.max_waypoints_per_batch = max_waypoints_per_batch
+        self.local_search_iterations = max(0, int(local_search_iterations))
+        self.use_dp_partition = use_dp_partition
+        self.allow_cross_robot_refine = allow_cross_robot_refine
+        self.align_sync_slots = align_sync_slots
+        self.exact_tsp_limit = max(0, int(exact_tsp_limit))
+        self.objective = objective if objective in ('sync', 'independent') else 'sync'
+        self.n_robots = len(self.robot_starts)
+        self._cost_cache: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], float] = {}
+        self._route_cache: Dict[Tuple[Tuple[int, ...], Tuple[Tuple[int, ...], ...]], Tuple[float, List[Tuple[int, ...]]]] = {}
+
+    def allocate(self) -> Tuple[Dict[int, List[List[Tuple[int, ...]]]],
+                               Dict[int, List[float]],
+                               Dict[str, Any]]:
+        """执行快速批次划分与轻量局部搜索。"""
+        start_time = time.time()
+        batches = {r: [[] for _ in range(self.n_batches)] for r in range(self.n_robots)}
+        capacity_relaxed = False
+
+        for robot_id in range(self.n_robots):
+            items = list(zip(self.initial_assignments.get(robot_id, []),
+                             self.arrival_times.get(robot_id, [])))
+            if not items:
+                continue
+
+            ordered = self._order_by_distance_time(robot_id, items)
+            if self.use_dp_partition:
+                robot_batches, relaxed = self._partition_ordered_route(
+                    self.robot_starts[robot_id], ordered)
+            else:
+                robot_batches, relaxed = self._greedy_partition_route(
+                    self.robot_starts[robot_id], ordered)
+            batches[robot_id] = robot_batches
+            capacity_relaxed = capacity_relaxed or relaxed
+
+        self._optimize_all_batch_orders(batches)
+        durations = self._compute_all_durations(batches)
+        if self.local_search_iterations:
+            durations = self._refine_by_moves(batches, durations)
+            self._optimize_all_batch_orders(batches)
+            durations = self._compute_all_durations(batches)
+        if self.align_sync_slots:
+            self._align_batch_slots_for_sync(batches, durations)
+            durations = self._compute_all_durations(batches)
+
+        stats = {
+            'success': sum(len(batch) for per_robot in batches.values()
+                           for batch in per_robot) == len(self.waypoints),
+            'n_batches': self.n_batches,
+            'batch_allocator': (
+                'first_arrival_dp_partition_with_local_search'
+                if self.use_dp_partition else 'first_arrival_greedy_partition'
+            ),
+            'batch_allocation_time': time.time() - start_time,
+            'batch_makespan': self._objective_value(durations),
+            'independent_robot_mission_time': self._mission_time(durations),
+            'synchronized_batch_mission_time': self._synchronized_batch_time(durations),
+            'sum_batch_time': sum(sum(v) for v in durations.values()),
+            'max_waypoints_per_batch': self.max_waypoints_per_batch,
+            'capacity_relaxed': capacity_relaxed,
+            'use_dp_partition': self.use_dp_partition,
+            'allow_cross_robot_refine': self.allow_cross_robot_refine,
+            'align_sync_slots': self.align_sync_slots,
+            'exact_tsp_limit': self.exact_tsp_limit,
+            'batch_objective': self.objective,
+        }
+        return batches, durations, stats
+
+    def _order_by_distance_time(self, robot_id: int,
+                                items: List[Tuple[Tuple[int, ...], float]]
+                                ) -> List[Tuple[int, ...]]:
+        """按首次扩散到达时间排序，时间相近时用离基地距离打破平局。"""
+        base = self.robot_starts[robot_id]
+        return [
+            wp for wp, _ in sorted(
+                items,
+                key=lambda item: (item[1], self._segment_cost(base, item[0]))
+            )
+        ]
+
+    def _partition_ordered_route(self, base: Tuple[int, ...],
+                                 ordered: List[Tuple[int, ...]]
+                                 ) -> Tuple[List[List[Tuple[int, ...]]], bool]:
+        """动态规划切分有序路径点，最小化该机器人的 n 次往返总时间。
+
+        优化点：
+        1. 区间往返代价使用前缀和 O(1) 查询，避免反复累加 route；
+        2. DP 只枚举容量允许的 j 范围；
+        3. 路径点足够时固定使用 n 个非空批次，空批次只用于点数不足的情况；
+        4. 重建后再对每个批次做小规模 TSP 顺序优化。
+        """
+        m = len(ordered)
+        if m == 0:
+            return [[] for _ in range(self.n_batches)], False
+
+        capacity = self.max_waypoints_per_batch
+        if capacity is not None and capacity * self.n_batches < m:
+            capacity = None
+            relaxed = True
+        else:
+            relaxed = False
+
+        if capacity is not None and capacity <= 0:
+            capacity = None
+            relaxed = True
+
+        n_groups = min(self.n_batches, m)
+
+        base_cost = np.zeros(m, dtype=np.float64)
+        return_cost = np.zeros(m, dtype=np.float64)
+        prefix_chain = np.zeros(m + 1, dtype=np.float64)
+        for i, wp in enumerate(ordered):
+            base_cost[i] = self._segment_cost(base, wp)
+            return_cost[i] = self._segment_cost(wp, base)
+            if i > 0:
+                prefix_chain[i] = (
+                    prefix_chain[i - 1]
+                    + self._segment_cost(ordered[i - 1], ordered[i])
+                )
+        prefix_chain[m] = prefix_chain[m - 1] if m > 0 else 0.0
+
+        group_cost = np.full((m, m + 1), np.inf, dtype=np.float64)
+        for i in range(m):
+            max_j = m + 1 if capacity is None else min(m + 1, i + capacity + 1)
+            for j in range(i + 1, max_j):
+                route = list(ordered[i:j])
+                if len(route) <= self.exact_tsp_limit:
+                    group_cost[i, j] = self._best_route(base, route)[0]
+                else:
+                    chain_cost = prefix_chain[j - 1] - prefix_chain[i]
+                    group_cost[i, j] = base_cost[i] + chain_cost + return_cost[j - 1]
+
+        inf = float('inf')
+        dp = np.full((n_groups + 1, m + 1), inf, dtype=np.float64)
+        prev = np.full((n_groups + 1, m + 1), -1, dtype=np.int32)
+        dp[0, 0] = 0.0
+
+        for k in range(1, n_groups + 1):
+            # 每个有效批次至少一个点；空批次在重建后补齐。
+            for i in range(k, m + 1):
+                for j in range(k - 1, i):
+                    cost = group_cost[j, i]
+                    if not np.isfinite(cost) or dp[k - 1, j] == inf:
+                        continue
+                    candidate = dp[k - 1, j] + cost
+                    if candidate < dp[k, i]:
+                        dp[k, i] = candidate
+                        prev[k, i] = j
+
+        if not np.isfinite(dp[n_groups, m]):
+            # 理论上只会在容量限制不可满足时发生；放宽容量保证不丢点。
+            saved_capacity = self.max_waypoints_per_batch
+            self.max_waypoints_per_batch = None
+            batches, _ = self._partition_ordered_route(base, ordered)
+            self.max_waypoints_per_batch = saved_capacity
+            return batches, True
+
+        batches = [[] for _ in range(n_groups)]
+        k = n_groups
+        i = m
+        while k > 0:
+            j = int(prev[k, i])
+            if j < 0:
+                j = i
+            batches[k - 1] = self._optimize_batch_order(base, list(ordered[j:i]))
+            i = j
+            k -= 1
+
+        while len(batches) < self.n_batches:
+            batches.append([])
+
+        return batches, relaxed
+
+    def _greedy_partition_route(self, base: Tuple[int, ...],
+                                ordered: List[Tuple[int, ...]]
+                                ) -> Tuple[List[List[Tuple[int, ...]]], bool]:
+        """贪心把点放入当前预计总时间最短的批次，用作消融基线。"""
+        batches = [[] for _ in range(self.n_batches)]
+        capacity = self.max_waypoints_per_batch
+        relaxed = False
+        if capacity is not None and capacity * self.n_batches < len(ordered):
+            capacity = None
+            relaxed = True
+
+        for wp in ordered:
+            best_idx = 0
+            best_score = float('inf')
+            for idx, batch in enumerate(batches):
+                if capacity is not None and len(batch) >= capacity:
+                    continue
+                # 先填空批，保证能形成尽可能多的出发-返回批次。
+                if not batch and sum(1 for b in batches if b) < min(self.n_batches, len(ordered)):
+                    best_idx = idx
+                    break
+                candidate = batch + [wp]
+                score = self._route_duration(base, candidate)
+                if score < best_score:
+                    best_score = score
+                    best_idx = idx
+            batches[best_idx].append(wp)
+
+        return batches, relaxed
+
+    def _refine_by_moves(self,
+                         batches: Dict[int, List[List[Tuple[int, ...]]]],
+                         durations: Dict[int, List[float]]
+                         ) -> Dict[int, List[float]]:
+        """跨批次/机器人做单点搬移和交换，降低全局完成时间。"""
+        durations = self._compute_all_durations(batches)
+        for _ in range(self.local_search_iterations):
+            current_score = self._objective_value(durations)
+            move = self._find_best_single_move(batches, durations, current_score)
+            swap = self._find_best_swap_move(batches, durations, current_score)
+
+            candidates = [item for item in (move, swap) if item is not None]
+            if not candidates:
+                break
+
+            _, new_batches, new_durations = min(candidates, key=lambda item: item[0])
+            batches.clear()
+            batches.update(new_batches)
+            durations = new_durations
+
+        return self._compute_all_durations(batches)
+
+    def _copy_batches(self, batches: Dict[int, List[List[Tuple[int, ...]]]]
+                      ) -> Dict[int, List[List[Tuple[int, ...]]]]:
+        return {
+            robot_id: [list(batch) for batch in robot_batches]
+            for robot_id, robot_batches in batches.items()
+        }
+
+    def _find_best_single_move(
+        self,
+        batches: Dict[int, List[List[Tuple[int, ...]]]],
+        durations: Dict[int, List[float]],
+        current_score: float
+    ) -> Optional[Tuple[float, Dict[int, List[List[Tuple[int, ...]]]], Dict[int, List[float]]]]:
+        best: Optional[Tuple[float, Dict[int, List[List[Tuple[int, ...]]]], Dict[int, List[float]]]] = None
+        robot_range_all = range(self.n_robots)
+
+        for src_robot_id in robot_range_all:
+            src_base = self.robot_starts[src_robot_id]
+            for src_idx, src_batch in enumerate(batches[src_robot_id]):
+                if not src_batch:
+                    continue
+                for wp in list(src_batch):
+                    dst_robot_range = (
+                        robot_range_all if self.allow_cross_robot_refine else [src_robot_id]
+                    )
+                    for dst_robot_id in dst_robot_range:
+                        dst_base = self.robot_starts[dst_robot_id]
+                        for dst_idx, dst_batch in enumerate(batches[dst_robot_id]):
+                            if src_robot_id == dst_robot_id and src_idx == dst_idx:
+                                continue
+                            if (self.max_waypoints_per_batch is not None
+                                    and len(dst_batch) >= self.max_waypoints_per_batch):
+                                continue
+
+                            candidate_batches = self._copy_batches(batches)
+                            candidate_batches[src_robot_id][src_idx].remove(wp)
+                            candidate_batches[src_robot_id][src_idx] = (
+                                self._optimize_batch_order(
+                                    src_base,
+                                    candidate_batches[src_robot_id][src_idx]
+                                )
+                            )
+                            candidate_batches[dst_robot_id][dst_idx] = (
+                                self._optimize_batch_order(
+                                    dst_base,
+                                    candidate_batches[dst_robot_id][dst_idx] + [wp]
+                                )
+                            )
+
+                            candidate_durations = {
+                                rid: list(values) for rid, values in durations.items()
+                            }
+                            candidate_durations[src_robot_id][src_idx] = (
+                                self._route_duration(
+                                    src_base,
+                                    candidate_batches[src_robot_id][src_idx]
+                                )
+                            )
+                            candidate_durations[dst_robot_id][dst_idx] = (
+                                self._route_duration(
+                                    dst_base,
+                                    candidate_batches[dst_robot_id][dst_idx]
+                                )
+                            )
+                            score = self._objective_value(candidate_durations)
+                            if score + 1e-9 >= current_score:
+                                continue
+                            if best is None or score < best[0] - 1e-9:
+                                best = (score, candidate_batches, candidate_durations)
+
+        return best
+
+    def _find_best_swap_move(
+        self,
+        batches: Dict[int, List[List[Tuple[int, ...]]]],
+        durations: Dict[int, List[float]],
+        current_score: float
+    ) -> Optional[Tuple[float, Dict[int, List[List[Tuple[int, ...]]]], Dict[int, List[float]]]]:
+        positions: List[Tuple[int, int, int, Tuple[int, ...]]] = []
+        for robot_id in range(self.n_robots):
+            for batch_idx, batch in enumerate(batches[robot_id]):
+                for point_idx, wp in enumerate(batch):
+                    positions.append((robot_id, batch_idx, point_idx, wp))
+
+        best: Optional[Tuple[float, Dict[int, List[List[Tuple[int, ...]]]], Dict[int, List[float]]]] = None
+        for left in range(len(positions)):
+            for right in range(left + 1, len(positions)):
+                r1, b1, p1, wp1 = positions[left]
+                r2, b2, p2, wp2 = positions[right]
+                if not self.allow_cross_robot_refine and r1 != r2:
+                    continue
+                if r1 == r2 and b1 == b2:
+                    continue
+
+                candidate_batches = self._copy_batches(batches)
+                candidate_batches[r1][b1][p1] = wp2
+                candidate_batches[r2][b2][p2] = wp1
+                candidate_batches[r1][b1] = self._optimize_batch_order(
+                    self.robot_starts[r1],
+                    candidate_batches[r1][b1]
+                )
+                candidate_batches[r2][b2] = self._optimize_batch_order(
+                    self.robot_starts[r2],
+                    candidate_batches[r2][b2]
+                )
+
+                candidate_durations = {
+                    rid: list(values) for rid, values in durations.items()
+                }
+                candidate_durations[r1][b1] = self._route_duration(
+                    self.robot_starts[r1],
+                    candidate_batches[r1][b1]
+                )
+                candidate_durations[r2][b2] = self._route_duration(
+                    self.robot_starts[r2],
+                    candidate_batches[r2][b2]
+                )
+                score = self._objective_value(candidate_durations)
+                if score + 1e-9 >= current_score:
+                    continue
+                if best is None or score < best[0] - 1e-9:
+                    best = (score, candidate_batches, candidate_durations)
+
+        return best
+
+    def _optimize_batch_order(self, base: Tuple[int, ...],
+                              batch: List[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
+        """批内顺序优化：小批次精确枚举，大批次最近邻+2-opt。"""
+        if len(batch) <= 1:
+            return list(batch)
+
+        cost, ordered = self._best_route(base, batch)
+        return ordered
+
+    def _optimize_all_batch_orders(
+        self,
+        batches: Dict[int, List[List[Tuple[int, ...]]]]
+    ) -> None:
+        """让返回的批次顺序与估计耗时使用的最短往返顺序一致。"""
+        for robot_id, robot_batches in batches.items():
+            base = self.robot_starts[robot_id]
+            for batch_idx, batch in enumerate(robot_batches):
+                robot_batches[batch_idx] = self._optimize_batch_order(base, batch)
+
+    def _best_route(self, base: Tuple[int, ...],
+                    batch: List[Tuple[int, ...]]) -> Tuple[float, List[Tuple[int, ...]]]:
+        """返回一批路径点的近似/精确最短往返顺序。"""
+        if not batch:
+            return 0.0, []
+
+        base = tuple(base)
+        key = (base, tuple(sorted(tuple(p) for p in batch)))
+        cached = self._route_cache.get(key)
+        if cached is not None:
+            return cached[0], list(cached[1])
+
+        if len(batch) <= self.exact_tsp_limit:
+            cost, ordered = self._held_karp_route(base, batch)
+        else:
+            ordered = self._nearest_neighbor_order(base, batch)
+            ordered = self._two_opt_route(base, ordered)
+            cost = self._route_duration_ordered(base, ordered)
+
+        self._route_cache[key] = (cost, list(ordered))
+        return cost, ordered
+
+    def _nearest_neighbor_order(self, base: Tuple[int, ...],
+                                batch: List[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
+        """最近邻顺序，作为大批次 TSP 初值。"""
+        remaining = list(batch)
+        ordered = []
+        current = base
+        while remaining:
+            idx = min(range(len(remaining)),
+                      key=lambda i: self._segment_cost(current, remaining[i]))
+            current = remaining.pop(idx)
+            ordered.append(current)
+        return ordered
+
+    def _held_karp_route(self, base: Tuple[int, ...],
+                         batch: List[Tuple[int, ...]]) -> Tuple[float, List[Tuple[int, ...]]]:
+        """Held-Karp 精确 TSP，适合每批容量较小的往返任务。"""
+        n = len(batch)
+        if n == 1:
+            wp = batch[0]
+            return self._segment_cost(base, wp) + self._segment_cost(wp, base), [wp]
+
+        # state: (mask, last_idx) -> (cost_from_base, prev_idx)
+        dp: Dict[Tuple[int, int], Tuple[float, int]] = {}
+        for i, wp in enumerate(batch):
+            dp[(1 << i, i)] = (self._segment_cost(base, wp), -1)
+
+        for mask in range(1, 1 << n):
+            for last in range(n):
+                state = (mask, last)
+                if state not in dp:
+                    continue
+                current_cost, _ = dp[state]
+                for nxt in range(n):
+                    bit = 1 << nxt
+                    if mask & bit:
+                        continue
+                    new_mask = mask | bit
+                    new_cost = current_cost + self._segment_cost(batch[last], batch[nxt])
+                    old = dp.get((new_mask, nxt))
+                    if old is None or new_cost < old[0]:
+                        dp[(new_mask, nxt)] = (new_cost, last)
+
+        full = (1 << n) - 1
+        best_last = -1
+        best_cost = float('inf')
+        for last in range(n):
+            state_cost, _ = dp[(full, last)]
+            total = state_cost + self._segment_cost(batch[last], base)
+            if total < best_cost:
+                best_cost = total
+                best_last = last
+
+        order_idx = []
+        mask = full
+        last = best_last
+        while last >= 0:
+            order_idx.append(last)
+            _, prev = dp[(mask, last)]
+            mask ^= 1 << last
+            last = prev
+        order_idx.reverse()
+        return best_cost, [batch[i] for i in order_idx]
+
+    def _two_opt_route(self, base: Tuple[int, ...],
+                       route: List[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
+        """2-opt 改善大批次路线，限制轮数保证速度。"""
+        if len(route) < 4:
+            return route
+
+        best = list(route)
+        best_cost = self._route_duration_ordered(base, best)
+        for _ in range(2):
+            improved = False
+            for i in range(len(best) - 2):
+                for j in range(i + 2, len(best)):
+                    candidate = best[:i + 1] + list(reversed(best[i + 1:j + 1])) + best[j + 1:]
+                    cost = self._route_duration_ordered(base, candidate)
+                    if cost + 1e-9 < best_cost:
+                        best = candidate
+                        best_cost = cost
+                        improved = True
+            if not improved:
+                break
+        return best
+
+    def _align_batch_slots_for_sync(self,
+                                    batches: Dict[int, List[List[Tuple[int, ...]]]],
+                                    durations: Dict[int, List[float]]) -> None:
+        """按批同步出发时，把长批次对齐到同一批次，降低 sum(max_batch_time)。"""
+        for robot_id in range(self.n_robots):
+            paired = list(zip(durations.get(robot_id, []), batches.get(robot_id, [])))
+            paired.sort(key=lambda item: item[0], reverse=True)
+            batches[robot_id][:] = [batch for _, batch in paired]
+            durations[robot_id][:] = [duration for duration, _ in paired]
+
+    def _compute_all_durations(self, batches: Dict[int, List[List[Tuple[int, ...]]]]
+                               ) -> Dict[int, List[float]]:
+        durations = {}
+        for robot_id, robot_batches in batches.items():
+            base = self.robot_starts[robot_id]
+            durations[robot_id] = [
+                self._route_duration(base, batch)
+                for batch in robot_batches
+            ]
+        return durations
+
+    def _route_duration(self, base: Tuple[int, ...],
+                        route: List[Tuple[int, ...]]) -> float:
+        """估计一批 base -> wp... -> base 的执行时间。"""
+        cost, _ = self._best_route(base, route)
+        return cost
+
+    def _route_duration_ordered(self, base: Tuple[int, ...],
+                                route: List[Tuple[int, ...]]) -> float:
+        """按给定顺序计算 base -> route -> base 的时间。"""
+        if not route:
+            return 0.0
+        total = 0.0
+        current = base
+        for wp in route:
+            total += self._segment_cost(current, wp)
+            current = wp
+        total += self._segment_cost(current, base)
+        return total
+
+    def _segment_cost(self, a: Tuple[int, ...], b: Tuple[int, ...]) -> float:
+        """直线积分近似代价，避免对每一对点重复跑 FMM。"""
+        a = tuple(int(x) for x in a)
+        b = tuple(int(x) for x in b)
+        key = (a, b) if a <= b else (b, a)
+        cached = self._cost_cache.get(key)
+        if cached is not None:
+            return cached
+
+        pa = np.asarray(a, dtype=np.float64)
+        pb = np.asarray(b, dtype=np.float64)
+        delta = (pb - pa) * np.asarray(self.spacing[:len(a)], dtype=np.float64)
+        distance = float(np.linalg.norm(delta))
+        if distance <= 0:
+            self._cost_cache[key] = 0.0
+            return 0.0
+
+        n_samples = max(2, min(64, int(distance) + 1))
+        ts = np.linspace(0.0, 1.0, n_samples)
+        slowness_sum = 0.0
+        for t in ts:
+            point = np.rint(pa * (1.0 - t) + pb * t).astype(int)
+            point = np.clip(point, 0, np.asarray(self.speed_field.shape) - 1)
+            speed = float(self.speed_field[tuple(point)])
+            slowness_sum += 1.0 / max(speed, 1e-9)
+
+        cost = distance * slowness_sum / n_samples
+        self._cost_cache[key] = cost
+        return cost
+
+    @staticmethod
+    def _makespan(durations: Dict[int, List[float]]) -> float:
+        best = 0.0
+        for robot_durations in durations.values():
+            if robot_durations:
+                best = max(best, max(robot_durations))
+        return best
+
+    @staticmethod
+    def _mission_time(durations: Dict[int, List[float]]) -> float:
+        """机器人可独立进入下一批时的总完成时间。"""
+        best = 0.0
+        for robot_durations in durations.values():
+            best = max(best, sum(robot_durations))
+        return best
+
+    def _synchronized_batch_time(self, durations: Dict[int, List[float]]) -> float:
+        """所有机器人按批同步出发时的总完成时间。"""
+        total = 0.0
+        for batch_id in range(self.n_batches):
+            total += max(
+                durations.get(robot_id, [0.0] * self.n_batches)[batch_id]
+                if batch_id < len(durations.get(robot_id, [])) else 0.0
+                for robot_id in range(self.n_robots)
+            )
+        return total
+
+    def _objective_value(self, durations: Dict[int, List[float]]) -> float:
+        if self.objective == 'independent':
+            return self._mission_time(durations)
+        if self.align_sync_slots:
+            durations = {
+                robot_id: sorted(robot_durations, reverse=True)
+                for robot_id, robot_durations in durations.items()
+            }
+        return self._synchronized_batch_time(durations)
+
+
 class MultiRobotWaypointAllocator:
     """
     多机器人路径点分配器
@@ -1687,38 +2340,92 @@ class MultiRobotWaypointAllocator:
             max_per_robot=self.gas_params.max_waypoints_per_robot
         )
         alloc_time = time.time() - alloc_start
+        time_map = cfmm.last_time_map
 
         print(f"   [Gas Diffusion] Allocation done in {alloc_time:.4f}s")
         for r in range(self.gas_params.n_robots):
             print(f"     Robot {r}: {len(assignments[r])} waypoints assigned")
+
+        batch_mode = self.gas_params.return_to_start or self.gas_params.n_batches is not None
+        batch_assignments: Dict[int, List[List[Tuple[int, ...]]]] = {}
+        batch_paths: Dict[int, List[List[List[Tuple[float, ...]]]]] = {}
+        batch_durations: Dict[int, List[float]] = {}
+        batch_stats: Dict[str, Any] = {}
+
+        if batch_mode:
+            if self.gas_params.n_batches is not None:
+                n_batches = self.gas_params.n_batches
+            elif self.gas_params.max_waypoints_per_batch:
+                n_batches = max(
+                    1,
+                    int(np.ceil(max((len(v) for v in assignments.values()), default=0)
+                                / self.gas_params.max_waypoints_per_batch))
+                )
+            else:
+                n_batches = 1
+
+            print(f"   [Batch Allocation] Planning {n_batches} round-trip batches...")
+            batch_allocator = BatchRoundTripAllocator(
+                speed_field=self.speed_field,
+                robot_starts=self.gas_params.robot_starts,
+                waypoints=self.gas_params.waypoints,
+                initial_assignments=assignments,
+                arrival_times=arrival_times,
+                spacing=self.spacing,
+                n_batches=n_batches,
+                max_waypoints_per_batch=self.gas_params.max_waypoints_per_batch,
+                local_search_iterations=self.gas_params.batch_local_search_iterations,
+                use_dp_partition=self.gas_params.batch_use_dp_partition,
+                allow_cross_robot_refine=self.gas_params.batch_allow_cross_robot_refine,
+                align_sync_slots=self.gas_params.batch_align_sync_slots,
+                exact_tsp_limit=self.gas_params.batch_exact_tsp_limit,
+                objective=self.gas_params.batch_objective,
+            )
+            batch_assignments, batch_durations, batch_stats = batch_allocator.allocate()
+            for r in range(self.gas_params.n_robots):
+                durations_text = ", ".join(f"{v:.2f}" for v in batch_durations.get(r, []))
+                print(f"     Robot {r}: batch durations [{durations_text}]")
 
         # Step 2: 为每个机器人规划路径段
         print("   [Path Planning] Planning path segments...")
         plan_start = time.time()
         robot_paths = {}
 
-        for robot_id, wp_list in assignments.items():
-            if not wp_list:
-                robot_paths[robot_id] = []
-                continue
+        if batch_mode:
+            for robot_id in range(self.gas_params.n_robots):
+                flat_segments = []
+                batch_paths[robot_id] = []
+                base = self.gas_params.robot_starts[robot_id]
 
-            # 构建路径链: start → wp1 → wp2 → ...
-            chain = [self.gas_params.robot_starts[robot_id]] + wp_list
-            segments = []
+                for batch in batch_assignments.get(robot_id, []):
+                    if not batch:
+                        batch_paths[robot_id].append([])
+                        continue
 
-            for i in range(len(chain) - 1):
-                seg_start = tuple(chain[i])
-                seg_goal = tuple(chain[i + 1])
-                try:
-                    path, _ = self.planner.plan(seg_start, seg_goal)
-                    if path:
-                        segments.append(path)
-                    else:
-                        segments.append([seg_start, seg_goal])
-                except Exception:
-                    segments.append([seg_start, seg_goal])
+                    chain = [base] + batch + [base]
+                    segments = []
+                    for i in range(len(chain) - 1):
+                        segment = self._plan_segment(tuple(chain[i]), tuple(chain[i + 1]))
+                        segments.append(segment)
+                        flat_segments.append(segment)
+                    batch_paths[robot_id].append(segments)
 
-            robot_paths[robot_id] = segments
+                robot_paths[robot_id] = flat_segments
+        else:
+            for robot_id, wp_list in assignments.items():
+                if not wp_list:
+                    robot_paths[robot_id] = []
+                    continue
+
+                # 构建路径链: start → wp1 → wp2 → ...
+                chain = [self.gas_params.robot_starts[robot_id]] + wp_list
+                segments = []
+
+                for i in range(len(chain) - 1):
+                    segment = self._plan_segment(tuple(chain[i]), tuple(chain[i + 1]))
+                    segments.append(segment)
+
+                robot_paths[robot_id] = segments
 
         plan_time = time.time() - plan_start
         total_time = time.time() - total_start
@@ -1730,6 +2437,7 @@ class MultiRobotWaypointAllocator:
             'n_waypoints_total': len(self.gas_params.waypoints),
             'n_waypoints_assigned': sum(len(v) for v in assignments.values()),
             'allocation_time': alloc_time,
+            'batch_mode': batch_mode,
             'path_planning_time': plan_time,
             'total_time': total_time,
             'per_robot': {
@@ -1737,10 +2445,13 @@ class MultiRobotWaypointAllocator:
                     'n_waypoints': len(assignments[r]),
                     'n_segments': len(robot_paths.get(r, [])),
                     'arrival_times': arrival_times[r],
+                    'batch_durations': batch_durations.get(r, []),
+                    'n_batches': len(batch_assignments.get(r, [])),
                 }
                 for r in range(self.gas_params.n_robots)
             }
         }
+        stats.update(batch_stats)
 
         return WaypointAllocationResult(
             assignments=assignments,
@@ -1748,8 +2459,23 @@ class MultiRobotWaypointAllocator:
             robot_paths=robot_paths,
             arrival_times=arrival_times,
             territory_map=territory_map,
+            time_map=time_map,
+            batch_assignments=batch_assignments,
+            batch_paths=batch_paths,
+            batch_durations=batch_durations,
             stats=stats
         )
+
+    def _plan_segment(self, seg_start: Tuple[int, ...],
+                      seg_goal: Tuple[int, ...]) -> List[Tuple[float, ...]]:
+        """规划单个路径段，失败时退化为直连线。"""
+        try:
+            path, _ = self.planner.plan(seg_start, seg_goal)
+            if path:
+                return path
+        except Exception:
+            pass
+        return [seg_start, seg_goal]
 
 
 class QValueMultiPathPlanner:
