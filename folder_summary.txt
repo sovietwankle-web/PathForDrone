@@ -1,0 +1,124 @@
+项目文件夹结构说明
+
+老师您好：
+
+下面是我对当前项目文件夹结构的整理说明。整体上看，这个项目已经形成了一个较完整的无人机三维路径规划研究代码框架，内容主要包括地形数据处理、路径规划核心算法、无人机运动约束、动态重规划、实验评测，以及学习型扩展模块。
+
+一、项目整体定位
+
+当前项目的核心目标，是围绕地形环境与天气扰动条件下的无人机三维路径规划问题，建立一套较完整的代码流程。整体逻辑可以概括为：
+
+地形数据读取与预处理 -> 代价场/速度场构建 -> 路径规划 -> 无人机约束修正 -> 动态环境下重规划 -> 实验评测与结果输出。
+
+从目录结构上看，真正的核心代码主要集中在 `terrain_processor/` 目录下；仓库根目录更多存放的是示例数据、分析脚本以及运行结果图。
+
+二、根目录内容说明
+
+1. `terrain_processor/`
+这是整个项目的主体目录，主要算法实现、实验模块和扩展模块都集中在这里。
+
+2. `README.md`
+这是项目的总说明文档，主要介绍整体思路、模块划分和实验框架。
+
+3. `analyze_tif.py`
+用于对原始 TIF 地形文件做基础信息分析。
+
+4. `detailed_analysis.py`
+用于进一步分析 TIF 文件的内容、统计特征和可视化结果。
+
+5. `create_test_data.py`
+用于生成合成地形测试数据，便于验证算法流程。
+
+6. 各类 `.tif` 文件
+如 `DEM_1m.tif`、`DEM_5m.tif`、`test_terrain.tif`、`Trend_未命名路径_GPX1(1).tif` 等，主要作为原始或测试用地形数据。
+
+7. 各类 `.png` 文件
+如 `hierarchical_fmm_result.png`、`multi_path_fmm_result.png`、`q_value_multipath_result.png`、`waypoint_allocation_result.png` 等，主要是算法运行后的可视化结果。
+
+三、`terrain_processor/` 目录的主要结构
+
+这个目录是项目的核心部分，按照功能大致可以分为以下四层。
+
+1. 路径规划核心层
+
+`viscous_hierarchical_fmm.py`
+这是目前最核心的算法文件，主要实现分层快速行进法（Hierarchical FMM）、黏滞速度场建模，以及多路径和路径点分配相关逻辑。
+
+`uav_constraints.py`
+这一部分负责把无人机自身的运动学约束接入规划过程，例如速度限制、爬升/下降约束、转弯半径等。
+
+`online_replanner.py`
+这一部分用于处理动态天气或雾场变化下的在线重规划，相当于在静态规划基础上加入闭环更新机制。
+
+`eikonal_path_planning.py`、`dynamic_eikonal_path_planning.py`、`dynamic_fog_path_planning.py`、`dynamic_fog_path_planning_optimized.py`
+这些文件属于不同版本的路径规划实现或优化尝试，主要用于算法对比和思路验证。
+
+`path_planning_benchmark.py`、`path_planning_3d_benchmark.py`、`path_planning_3d_complete.py`、`algorithm_comparison.py`
+这些脚本主要用于基准测试、三维规划展示和算法性能对比。
+
+2. 实验评测层
+
+`experiments/`
+这里存放实验框架代码，主要包括数据生成、基线方法、对比实验、消融实验等内容。
+
+`experiments_data/`
+这里存放实验跑出的结果数据，主要是 `csv`、`json`、`pkl` 等格式文件，用于保存对比实验和统计结果。
+
+`output/`
+这里主要存放算法运行后的图像和结果文件，是实验输出目录。
+
+3. 学习型扩展层
+
+`neural_allocator/`
+这是项目中的学习型模块，主要面向多无人机任务分配或路径点分配问题。
+
+其中大致又包括三部分：
+
+`model.py`、`allocator.py`、`decoder.py`、`features.py` 等文件，主要负责网络结构、特征提取和推理逻辑；
+
+`training/` 目录，主要负责训练数据生成、数据集封装、奖励设计、监督学习和强化学习训练；
+
+`scripts/` 目录，主要提供训练和评估脚本；
+
+`checkpoints/` 目录，主要保存已经训练好的模型参数。
+
+4. 地形处理工具层
+
+`tif/`
+这是一个相对独立的地形处理子模块，主要负责读取 TIF/GeoTIFF 数据、做平滑处理、生成等高线图和阴影图等。
+
+其中包括：
+
+`terrain_processor/`
+这是该子模块内部的一个小型处理包，负责读文件、处理数据和可视化。
+
+`tests/`
+存放相应测试代码。
+
+`examples/`
+存放基础使用示例。
+
+`main.py`
+提供命令行入口，可直接对地形文件做处理和输出。
+
+`output/`
+存放该地形处理模块单独生成的示例结果。
+
+四、对当前代码结构的整体理解
+
+从目前的组织方式看，这个项目已经不是单一脚本，而是一个较完整的研究型代码仓库。当前结构大致体现为：
+
+1. 用 `tif/` 模块解决地形数据读入和预处理问题；
+2. 用 `viscous_hierarchical_fmm.py` 作为主规划器，完成核心路径搜索；
+3. 用 `uav_constraints.py` 把无人机实际飞行约束纳入规划；
+4. 用 `online_replanner.py` 处理动态天气变化下的实时更新；
+5. 用 `experiments/` 和 `experiments_data/` 组织实验评测与结果整理；
+6. 用 `neural_allocator/` 扩展到学习型、多无人机场景。
+
+五、总结
+
+整体来看，这个文件夹目前已经形成了“地形处理 + 路径规划 + UAV 约束 + 在线重规划 + 实验评测 + 神经网络扩展”的完整结构。
+
+如果从研究实现角度概括，目前的核心工作重点仍然集中在 `terrain_processor/` 目录，其他目录主要承担数据支撑、实验脚本和结果输出的作用。
+
+以上是我对当前项目文件夹结构的整理说明。
